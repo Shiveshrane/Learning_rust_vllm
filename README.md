@@ -9,7 +9,7 @@ Built as a 5-day learning project.
 ## Lessons
 
 - [x] **Day 0** — workspace, Metal smoke test, checkpoint verified
-- [ ] [**Day 1**](lessons/day1.md) — forward pass, greedy decode, golden-logit gate
+- [x] [**Day 1**](lessons/day1.md) — forward pass, greedy decode, golden-logit gate
 - [ ] [**Day 2**](lessons/day2.md) — KV cache, sampling, SSE streaming server
 - [ ] [**Day 3**](lessons/day3.md) — paged KV cache, continuous batching
 - [ ] [**Day 4**](lessons/day4.md) — KV quantization, prefix caching, benchmarks
