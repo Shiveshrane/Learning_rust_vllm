@@ -1,0 +1,13 @@
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+qwen.workspace = true
+candle-core.workspace = true
+candle-nn.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tokenizers.workspace = true
+rand.workspace = true

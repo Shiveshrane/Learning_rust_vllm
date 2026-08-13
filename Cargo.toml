@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/qwen",
+    "crates/engine",
+    "crates/server",
+    "crates/bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+qwen = { path = "crates/qwen" }
+engine = { path = "crates/engine" }
+
+candle-core = { version = "0.11", features = ["metal"] }
+candle-nn = { version = "0.11", features = ["metal"] }
+tokenizers = "0.22"
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+half = "2"
+
+# Pulled in from Day 2 onward.
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+# Day 1 debugging is unbearable in a plain debug build: the tokenizer and any
+# CPU-fallback path run ~50x slower. Keep dependencies optimized while your own
+# crates stay debuggable.
+[profile.dev.package."*"]
+opt-level = 3

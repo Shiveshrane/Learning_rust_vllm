@@ -1,0 +1,63 @@
+use anyhow::Result;
+use candle_core::{DType, Device, Tensor, IndexOp, D};
+use candle_nn::VarBuilder;
+use qwen::config::QwenConfig;
+use qwen::model::Qwen2;
+use qwen::device::{pick, Backend};
+use qwen::paths::ModelPaths;
+use qwen::cache::KVCache;
+use engine::sampling::{Params, Sampler};
+
+
+const PROMPT:&str="The capital of France is";
+
+fn greedy_decode(model: &Qwen2, tok:&tokenizers::Tokenizer, input:&[u32], device:&Device, eos:u32, max_new_tokens:usize, cache: &mut KVCache)->Result<String>{
+    let mut ip_ids=input.to_vec();
+    cache.reset();
+    let input=Tensor::new(ip_ids.as_slice(), device)?.unsqueeze(0)?;
+    let logits=model.forward_prefill(&input, cache)?;
+    let mut last_tok=logits.i((0, ip_ids.len()-1))?.to_dtype(DType::F32)?;
+    for i in 0..max_new_tokens{
+        let top=last_tok.argmax(D::Minus1)?.to_scalar::<u32>()?;
+        if top==eos{
+            println!("Step {}: Generated EOS token ID {}, stopping.", i+1, top);
+            break;
+        }
+        ip_ids.push(top);
+        let text=tok.decode(&[top], false).map_err(anyhow::Error::from_boxed)?;
+        println!("Step {}: Generated token ID {} -> {:?}", i+1, top, text);
+        let inp=Tensor::new(&[top], device)?.unsqueeze(0)?;
+        let logits=model.forward_decode(&inp, cache)?;
+        last_tok=logits.i((0, 0))?.to_dtype(DType::F32)?;
+
+    }
+    Ok(tok.decode(&ip_ids, false).map_err(anyhow::Error::from_boxed)?)
+}
+fn main()->Result<()>{
+    let device=pick(Backend::Auto)?;
+    let path=ModelPaths::from_cache()?;
+    let cfg=QwenConfig::from_path(&path.config)?;
+    let tok=tokenizers::Tokenizer::from_file(&path.tokenizer).map_err(anyhow::Error::from_boxed)?;
+    let mut cache=KVCache::new(&cfg, 4096, DType::F32, &device)?;
+    let t0=std::time::Instant::now();
+    let vb=unsafe{
+        VarBuilder::from_mmaped_safetensors(&path.weights, DType::F32,  &device)?
+    };
+    let model=Qwen2::load(&cfg, 4096, vb)?;
+    println!("Loaded weights in {:?}", t0.elapsed());
+
+    let ids=tok
+    .encode(PROMPT, false)
+    .map_err(anyhow::Error::from_boxed)?
+    .get_ids()
+    .to_vec();
+    println!("Prompt: {:?}", PROMPT);
+    println!("Token IDs: {:?}", ids);
+
+    let t0=std::time::Instant::now();
+    let out = greedy_decode(&model, &tok, &ids, &device, cfg.eos_token_id, 20, &mut cache)?;
+    println!("Generated in {:.3}s", t0.elapsed().as_secs_f32());
+    println!("Output: {}", out);
+    Ok(())
+
+}
