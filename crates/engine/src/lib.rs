@@ -17,3 +17,4 @@
 //! layers downstream as garbled output.
 pub mod sampling;
 pub mod stop; // WRITTEN BY CLAUDE — Day 2 Block 3
+pub mod detokenize;

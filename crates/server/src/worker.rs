@@ -10,6 +10,7 @@ use qwen::device::{pick, Backend};
 use qwen::model::Qwen2;
 use qwen::paths::ModelPaths;
 use tokio::sync::mpsc;
+use engine::detokenize::Detokenizer;
 
 pub enum Event{
     Token(String),
@@ -87,7 +88,6 @@ fn run_job(st: &mut WorkerState, job:Job)->Result<()>{
     st.tok.get_vocab_size(true)
 );
     let mut stopper=Stopper::new(st.eos, req.max_tokens, req.stop.clone());
-
     let ids:Vec<u32>=st.tok.encode(req.prompt.as_str(), false)
     .map_err(anyhow::Error::from_boxed)?
     .get_ids().to_vec();
@@ -98,9 +98,11 @@ fn run_job(st: &mut WorkerState, job:Job)->Result<()>{
     let mut last=logits.i((0, prompt_tokens-1))?.to_dtype(DType::F32)?.to_device(&st.device)?;
 
     let mut all=ids;
+    let mut detok=Detokenizer::new(&st.tok);
     loop{
         let top=sampler.sample(&last, &all)?;
-        let piece=st.tok.decode(&[top], false).map_err(anyhow::Error::from_boxed)?;
+        //let piece=st.tok.decode(&[top], false).map_err(anyhow::Error::from_boxed)?;
+        let piece=detok.push(top)?;
         let step=stopper.push(top, &piece);
         if !step.text.is_empty(){
             let _=job.tx.send(Event::Token(step.text));

@@ -3,9 +3,12 @@ mod worker;
 
 use axum::{extract::State, http::StatusCode, routing::{get, post}, Router, Json};
 use api::{CompletionRequest, CompletionResponse, Usage};
+use axum::response::{sse::Event as SseEvent, IntoResponse, Response, Sse};
 use worker::{Event, Job};
 use tokio::sync::mpsc;
-
+use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::{Stream, StreamExt};
+use std::convert::Infallible;
 
 
 #[derive(Clone)]
@@ -19,27 +22,73 @@ async fn health()->&'static str{
     "OK"
 }
 
+fn stream_response(rx:mpsc::UnboundedReceiver<Event>)->Sse<impl Stream<Item = Result<SseEvent, Infallible>>>{
+    let stream=UnboundedReceiverStream::new(rx).map(|ev|{
+        let data=match ev{
+            Event::Token(s)=>s,
+            Event::Done{reason, prompt_tokens, completion_tokens}=>{
+                format!("DONE: reason={:?}, prompt_tokens={}, completion_tokens={}", reason, prompt_tokens, completion_tokens)
+            }
+            Event::Error(e)=>format!("ERROR: {}", e),
+        };
+        Ok(SseEvent::default().data(data))
+    });
+    Sse::new(stream)
+}
 
-async fn completions(State(st):State<AppState>,Json(req):Json<CompletionRequest>)->Result<Json<CompletionResponse>, (StatusCode, String)>{
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    st.jobs.send(Job { req, tx })
-        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "worker gone".into()))?;
-
-    let mut text = String::new();
-    while let Some(ev) = rx.recv().await {
-        match ev {
-            Event::Token(s) => text.push_str(&s),
-            Event::Done { reason, prompt_tokens, completion_tokens } => {
-                return Ok(Json(CompletionResponse {
+async fn collect_response(mut rx: mpsc::UnboundedReceiver<Event>)->Result<Json<CompletionResponse>,(StatusCode, String)>{
+    let mut text=String::new();
+    while let Some(ev)=rx.recv().await{
+        match ev{
+            Event::Token(s)=>text.push_str(&s),
+            Event::Done{
+                reason, prompt_tokens, completion_tokens
+            }=>{
+                return Ok(Json(CompletionResponse{
                     text,
-                    finish_reason: format!("{reason:?}"),
-                    usage: Usage { prompt_tokens, completion_tokens },
+                    finish_reason:format!("{reason:?}"),
+                    usage:Usage{prompt_tokens, completion_tokens},
                 }));
             }
-            Event::Error(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
+            Event::Error(e)=>return Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
         }
     }
     Err((StatusCode::INTERNAL_SERVER_ERROR, "worker closed".into()))
+}
+
+
+
+async fn completions(State(st):State<AppState>,Json(req):Json<CompletionRequest>)->Response{
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let stream=req.stream;
+
+    // st.jobs.send(Job { req, tx })
+    //     .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "worker gone".into()))?;
+
+    // let mut text = String::new();
+    // while let Some(ev) = rx.recv().await {
+    //     match ev {
+    //         Event::Token(s) => text.push_str(&s),
+    //         Event::Done { reason, prompt_tokens, completion_tokens } => {
+    //             return Ok(Json(CompletionResponse {
+    //                 text,
+    //                 finish_reason: format!("{reason:?}"),
+    //                 usage: Usage { prompt_tokens, completion_tokens },
+    //             }));
+    //         }
+    //         Event::Error(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
+    //     }
+    // }
+    // Err((StatusCode::INTERNAL_SERVER_ERROR, "worker closed".into()))
+
+    if st.jobs.send(Job {req, tx}).is_err(){
+        return (StatusCode::SERVICE_UNAVAILABLE, "worker gone").into_response();
+    }
+    if stream{
+        stream_response(rx).into_response()
+    }else{
+        collect_response(rx).await.into_response()
+    }
 }
 
 
