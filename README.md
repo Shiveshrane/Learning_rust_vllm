@@ -10,7 +10,7 @@ Built as a 5-day learning project.
 
 - [x] **Day 0** — workspace, Metal smoke test, checkpoint verified
 - [x] [**Day 1**](lessons/day1.md) — forward pass, greedy decode, golden-logit gate
-- [ ] [**Day 2**](lessons/day2.md) — KV cache, sampling, SSE streaming server
+- [x] [**Day 2**](lessons/day2.md) — KV cache, sampling, SSE streaming server
 - [ ] [**Day 3**](lessons/day3.md) — paged KV cache, continuous batching
 - [ ] [**Day 4**](lessons/day4.md) — KV quantization, prefix caching, benchmarks
 - [ ] [**Day 5**](lessons/day5.md) — YaRN, long context, OpenAI compatibility
@@ -64,3 +64,55 @@ and at real prefill shapes before drawing conclusions about dtype choice.
 
 Checkpoint: 339 tensors (28 × 12 + embed + norm + lm_head), 3.55 GB bf16, q/k/v
 biases present and o_proj bias absent as expected.
+
+## Day 2 measurements
+
+F32 weights on Metal, single stream, measured over HTTP/SSE against a warm
+server. Median of three runs.
+
+| | value |
+|---|---|
+| TTFT (5-token prompt) | **57.7 ms** |
+| Prefill (480-token prompt) | **1083 tok/s** |
+| Decode (short context) | **40.8 tok/s** |
+| Decode (480-token context) | 35.3 tok/s |
+
+Measure warm. The first request after startup shows a TTFT of ~858 ms — Metal
+kernel compilation and paging in the mmap'd weights, not prefill.
+
+### What the KV cache bought
+
+Same prompt, 20 tokens, byte-identical output at every stage:
+
+| | 20 tok | tok/s | vs Day 1 |
+|---|---|---|---|
+| Day 1, recompute the whole prefix each step | 7.34 s | 2.7 | 1× |
+| KV cache, hand-rolled attention | 1.20 s | 16.6 | 6.1× |
+| + `sdpa`, `repeat_kv` deleted | 0.54 s | 37.3 | **13.7×** |
+
+Day 1 was `O(N²)`; extrapolating it to 512 tokens gives roughly 80 minutes
+against 13 seconds measured.
+
+### Prefill and decode are different machines
+
+Taking 1.78e9 parameters and `2·P·N` FLOPs, against the 5.96 TFLOP/s ceiling
+measured on Day 0:
+
+| | achieved | % of peak |
+|---|---|---|
+| Prefill | 3.86 TFLOP/s | 65% |
+| Decode | 0.145 TFLOP/s | 2.4% |
+
+A 27× gap on identical weights. Prefill does `T` tokens' work per pass over the
+weights and is compute-bound; decode does one token's work per pass over the
+same 3.5 GB and is bandwidth-bound at ~2 FLOP/byte. That ratio is the argument
+for batching — 16 sequences read those weights once — and it is what Day 3 cashes
+in.
+
+Decode falls from 40.8 to 35.3 tok/s as context grows to 480 tokens: attention
+is `O(context)` per step, and the cache readback copies the whole span with
+`.contiguous()` on every layer.
+
+Sampling costs ~10 ms/token when enabled (37.3 → 27.4 tok/s), almost entirely the
+608 KB device→host `to_vec1` of the logits row. The fix is on-device top-k so
+only survivors cross the bus; not yet done.

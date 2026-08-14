@@ -18,3 +18,4 @@
 pub mod sampling;
 pub mod stop; // WRITTEN BY CLAUDE — Day 2 Block 3
 pub mod detokenize;
+pub mod blocks; // WRITTEN BY CLAUDE — Day 3 Block 1
