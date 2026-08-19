@@ -5,8 +5,8 @@ use qwen::config::QwenConfig;
 use qwen::model::Qwen2;
 use qwen::device::{pick, Backend};
 use qwen::paths::ModelPaths;
-use qwen::cache::KVCache;
-use engine::sampling::{Params, Sampler};
+use qwen::cache::{KVCache, KVStore};
+//use engine::sampling::{Params, Sampler};
 
 
 const PROMPT:&str="The capital of France is";
@@ -15,8 +15,10 @@ fn greedy_decode(model: &Qwen2, tok:&tokenizers::Tokenizer, input:&[u32], device
     let mut ip_ids=input.to_vec();
     cache.reset();
     let input=Tensor::new(ip_ids.as_slice(), device)?.unsqueeze(0)?;
-    let logits=model.forward_prefill(&input, cache)?;
+    // let logits=model.forward_prefill(&input, cache)?;
+    let logits=model.forward_prefill(&input, cache, 0)?;
     let mut last_tok=logits.i((0, ip_ids.len()-1))?.to_dtype(DType::F32)?;
+    let mut pos=ip_ids.len();
     for i in 0..max_new_tokens{
         let top=last_tok.argmax(D::Minus1)?.to_scalar::<u32>()?;
         if top==eos{
@@ -27,7 +29,9 @@ fn greedy_decode(model: &Qwen2, tok:&tokenizers::Tokenizer, input:&[u32], device
         let text=tok.decode(&[top], false).map_err(anyhow::Error::from_boxed)?;
         println!("Step {}: Generated token ID {} -> {:?}", i+1, top, text);
         let inp=Tensor::new(&[top], device)?.unsqueeze(0)?;
-        let logits=model.forward_decode(&inp, cache)?;
+        // let logits=model.forward_decode(&inp, cache)?;
+        let logits=model.forward_decode(&inp, cache, pos)?;
+        pos+=1;
         last_tok=logits.i((0, 0))?.to_dtype(DType::F32)?;
 
     }

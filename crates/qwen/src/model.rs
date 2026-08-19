@@ -2,8 +2,9 @@ use anyhow::Result;
 use candle_core::{DType, Device, Tensor, D};
 use candle_nn::{embedding, linear, linear_no_bias, Embedding, Linear, Module, VarBuilder};
 use candle_nn::ops::sdpa;
-use crate::cache::KVCache;
+use crate::cache::{KVCache, KVStore};
 use crate::config::QwenConfig;
+
 
 pub struct RMSNorm{
     pub eps: f64,
@@ -133,7 +134,14 @@ impl Attention{
         .reshape((b, kv_h*self.kv_groups, s, d))?)
     }
 
-    pub fn forward(&self, x:&Tensor, rope: &RoPE, mask: Option<&Tensor>, offset: usize, cache: &mut KVCache, layer: usize)->Result<Tensor>{
+    pub fn forward(&self, 
+        x:&Tensor, 
+        rope: &RoPE, 
+        mask: Option<&Tensor>, 
+        offset: usize, 
+        //cache: &mut KVCache,
+        store: &dyn KVStore,
+        layer: usize)->Result<Tensor>{
         let (b, s, _)=x.dims3()?;
         let q=self.q_proj.forward(x)?
         .reshape((b,s,self.num_heads,self.head_dim))?
@@ -148,7 +156,10 @@ impl Attention{
         let q=rope.apply(&q, offset)?;
         let k=rope.apply(&k, offset)?;
 
-        let (k, v)=cache.append(layer, &k, &v)?;
+        store.write(layer, offset, &k, &v)?;
+        let (k, v) = store.gather(layer, offset + s)?;
+
+        // let (k, v)=cache.append(layer, &k, &v)?;
 
         // let k=self.repeat_kv(&k)?; //Remove after SDPA
         // let v=self.repeat_kv(&v)?; //Remove after SDPA
@@ -188,9 +199,16 @@ impl DecoderLayer{
         })
 
     }
-    pub fn forward(&self, x: &Tensor, rope: &RoPE, mask:Option<&Tensor>, offset:usize, cache: &mut KVCache, layer: usize)->Result<Tensor>{
+    pub fn forward(&self, 
+        x: &Tensor, 
+        rope: &RoPE, 
+        mask:Option<&Tensor>, 
+        offset:usize, 
+        //cache: &mut KVCache,
+        store: &dyn KVStore, 
+        layer: usize)->Result<Tensor>{
         let residual=self.input_layernorm.forward(x)?;
-        let residual=self.self_attention.forward(&residual, rope, mask, offset, cache, layer)?;
+        let residual=self.self_attention.forward(&residual, rope, mask, offset, store, layer)?;
         let x=(x+residual)?;
         let residual=self.post_attention_layernorm.forward(&x)?;
         let residual=self.mlp.forward(&residual)?;
@@ -278,33 +296,45 @@ impl Qwen2{
     // }
 
 
-    pub fn forward_prefill(&self, input_ids:&Tensor, cache: &mut KVCache)->Result<Tensor>{
+    pub fn forward_prefill(
+        &self, 
+        input_ids:&Tensor, 
+        //cache: &mut KVCache
+        store: &dyn KVStore,
+        start_pos: usize
+    )->Result<Tensor>{
         let (_b, s)=input_ids.dims2()?;
         let mut h=self.embedding.forward(input_ids)?;
         // let mask=if s==1{
             // None
         // }else{
-        let mask=Some(causal_mask(s, cache.len(), self.dtype, &self.device)?
-        .reshape((1,1,s,cache.len()+s))?
-        .expand((1, self.layers[0].self_attention.num_heads, s, cache.len()+s))?);
+        let mask=Some(causal_mask(s, start_pos, self.dtype, &self.device)?
+        .reshape((1,1,s,start_pos+s))?
+        .expand((1, self.layers[0].self_attention.num_heads, s, start_pos+s))?);
         // };
         
         for (i, layer) in self.layers.iter().enumerate(){
-            h=layer.forward(&h, &self.rope, mask.as_ref(), cache.len(), cache, i)?;
+            h=layer.forward(&h, &self.rope, mask.as_ref(), start_pos, store, i)?;
         }
-        cache.advance(s);
+        //cache.advance(s);
         let h=self.final_layernorm.forward(&h)?;
         Ok(self.lm_head.forward(&h)?)
     }
 
 
-    pub fn forward_decode(&self, input_ids:&Tensor, cache: &mut KVCache)->Result<Tensor>{
-        let offset=cache.len();
+    pub fn forward_decode(
+        &self, 
+        input_ids:&Tensor, 
+        //cache: &mut KVCache
+        store: &dyn KVStore,
+        start_pos: usize
+    )->Result<Tensor>{
+        let offset=start_pos;
         let mut h=self.embedding.forward(input_ids)?;
         for (i, layer) in self.layers.iter().enumerate(){
-            h=layer.forward(&h, &self.rope, None, offset, cache, i)?;
+            h=layer.forward(&h, &self.rope, None, offset, store, i)?;
         }
-        cache.advance(1);
+        //cache.advance(1);
         let h=self.final_layernorm.forward(&h)?;
         Ok(self.lm_head.forward(&h)?)
     }

@@ -11,6 +11,11 @@ pub struct KVCache{
     seq_len: usize,
 }
 
+pub trait KVStore{
+    fn write(&self, layer:usize, start_pos:usize, keys:&Tensor, values:&Tensor)->Result<()>;
+    fn gather(&self, layer:usize, len:usize)->Result<(Tensor, Tensor)>;
+}
+
 impl KVCache{
     pub fn new(cfg:&QwenConfig, max_seq:usize, dtype:DType, device:&Device)->Result<Self>{
         let n_layers=cfg.num_hidden_layers;
@@ -59,3 +64,26 @@ impl KVCache{
         // self.values.iter_mut().for_each(|v| v.zero_().unwrap());
     }
 }
+
+impl KVStore for KVCache{
+    fn write(&self, layer:usize, start_pos:usize, keys:&Tensor, values:&Tensor)->Result<()>{
+        let s=keys.dim(2)?;
+        let end=start_pos+s;
+        if end>self.max_seq{
+            anyhow::bail!("KVCache write overflow: max_seq={} but trying to write {} new
+    tokens at start_pos={}", self.max_seq, s, start_pos);
+    }
+    self.keys[layer].slice_set(keys, 2, start_pos)?;
+    self.values[layer].slice_set(values, 2, start_pos)?;
+    Ok(())
+}
+    
+    fn gather(&self, layer:usize, len:usize)->Result<(Tensor, Tensor)>{
+        let k=self.keys[layer].narrow(2,0,len)?.contiguous()?;
+        let v=self.values[layer].narrow(2,0,len)?.contiguous()?;
+        Ok((k, v))
+    }
+}
+
+
+

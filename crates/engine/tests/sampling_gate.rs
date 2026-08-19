@@ -39,7 +39,9 @@ fn generate(
     let mut out: Vec<u32> = ids.to_vec();
 
     let input = Tensor::new(ids, device)?.unsqueeze(0)?;
-    let logits = model.forward_prefill(&input, cache)?;
+    let logits = model.forward_prefill(&input, cache, 0)?;
+    // Position is the caller's job since the KVStore refactor.
+    let mut pos = ids.len();
     let mut last = logits.i((0, ids.len() - 1))?.to_dtype(DType::F32)?;
 
     for _ in 0..N {
@@ -50,9 +52,10 @@ fn generate(
         out.push(top);
         let inp = Tensor::new(&[top], device)?.unsqueeze(0)?;
         last = model
-            .forward_decode(&inp, cache)?
+            .forward_decode(&inp, cache, pos)?
             .i((0, 0))?
             .to_dtype(DType::F32)?;
+        pos += 1;
     }
     Ok(out[ids.len()..].to_vec())
 }

@@ -68,7 +68,7 @@ fn logits_match_hf_golden() -> Result<()> {
     let mut cache = KVCache::new(&cfg, 4096, DType::F32, &device)?;
     let input = Tensor::new(ids.as_slice(), &device)?.unsqueeze(0)?;
     let ours = model
-        .forward_prefill(&input, &mut cache)?
+        .forward_prefill(&input, &cache, 0)?
         .i(0)?
         .to_dtype(DType::F32)?
         .to_device(&cpu)?;
@@ -105,11 +105,11 @@ fn logits_match_hf_golden() -> Result<()> {
     // seq_len instead of end all move this number off zero.
     cache.reset();
     let head = Tensor::new(&ids[..t - 1], &device)?.unsqueeze(0)?;
-    model.forward_prefill(&head, &mut cache)?;
+    model.forward_prefill(&head, &cache, 0)?;
 
     let tail = Tensor::new(&ids[t - 1..], &device)?.unsqueeze(0)?;
     let decoded = model
-        .forward_decode(&tail, &mut cache)?
+        .forward_decode(&tail, &cache, t - 1)?
         .i((0, 0))?
         .to_dtype(DType::F32)?
         .to_device(&cpu)?;

@@ -16,6 +16,7 @@
 //! It catches nearly every paging bug the moment it happens rather than three
 //! layers downstream as garbled output.
 pub mod sampling;
-pub mod stop; 
+pub mod stop;
+pub mod detokenize;
 pub mod block;
 pub mod paged_attn;

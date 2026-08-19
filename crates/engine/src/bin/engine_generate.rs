@@ -17,8 +17,12 @@ fn greedy_decode(model: &Qwen2, tok:&tokenizers::Tokenizer, input:&[u32], device
     let mut ip_ids=input.to_vec();
     cache.reset();
     let input=Tensor::new(ip_ids.as_slice(), device)?.unsqueeze(0)?;
-    let logits=model.forward_prefill(&input, cache)?;
+    // let logits=model.forward_prefill(&input, cache)?;
+    let logits=model.forward_prefill(&input, cache, 0)?;
     let mut last_tok=logits.i((0, ip_ids.len()-1))?.to_dtype(DType::F32)?;
+    // Position is the caller's job now: the cache no longer tracks it.
+    // The prompt occupies 0..T, so the first generated token sits at T.
+    let mut pos=ip_ids.len();
     // for i in 0..max_new_tokens{
     //     //let top=last_tok.argmax(D::Minus1)?.to_scalar::<u32>()?;
     //     let top=sampler.sample(&last_tok, &ip_ids)?;
@@ -48,7 +52,9 @@ fn greedy_decode(model: &Qwen2, tok:&tokenizers::Tokenizer, input:&[u32], device
     }
     ip_ids.push(top);
     let inp=Tensor::new(&[top], device)?.unsqueeze(0)?; 
-    let logits=model.forward_decode(&inp, cache)?;
+    // let logits=model.forward_decode(&inp, cache)?;
+    let logits=model.forward_decode(&inp, cache, pos)?;
+    pos+=1;
     last_tok=logits.i((0, 0))?.to_dtype(DType::F32)?;
     }
     Ok(stopper.text().to_string())

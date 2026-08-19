@@ -94,9 +94,13 @@ fn run_job(st: &mut WorkerState, job:Job)->Result<()>{
     let prompt_tokens=ids.len();
     st.cache.reset();
     let mut input=Tensor::new(ids.as_slice(), &st.device)?.unsqueeze(0)?;
-    let logits=st.model.forward_prefill(&input, &mut st.cache)?;
+    // let logits=st.model.forward_prefill(&input, &mut st.cache)?;
+    let logits=st.model.forward_prefill(&input, &st.cache, 0)?;
     let mut last=logits.i((0, prompt_tokens-1))?.to_dtype(DType::F32)?.to_device(&st.device)?;
 
+    // Position is the caller's job now: the cache no longer tracks it.
+    // The prompt occupies 0..T, so the first generated token sits at T.
+    let mut pos=prompt_tokens;
     let mut all=ids;
     let mut detok=Detokenizer::new(&st.tok);
     loop{
@@ -117,7 +121,9 @@ fn run_job(st: &mut WorkerState, job:Job)->Result<()>{
         }
         all.push(top);
         let inp=Tensor::new(&[top], &st.device)?.unsqueeze(0)?;
-        last = st.model.forward_decode(&inp, &mut st.cache)?.i((0, 0))?.to_dtype(DType::F32)?;
+        // last = st.model.forward_decode(&inp, &mut st.cache)?.i((0, 0))?.to_dtype(DType::F32)?;
+        last = st.model.forward_decode(&inp, &st.cache, pos)?.i((0, 0))?.to_dtype(DType::F32)?;
+        pos+=1;
 
     }
 }
