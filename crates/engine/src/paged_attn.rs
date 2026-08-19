@@ -1,4 +1,5 @@
 use qwen::config::QwenConfig;
+use crate::block::BlockTable;
 use candle_core::{DType, Device, Result, Tensor};
 use anyhow::Result;
 
@@ -11,7 +12,7 @@ pub struct KVPool{
 
 
 impl KVPool{
-    pub fn new(cfg:&QwenConfig, num_blocks:usize, block_size:usize, dtype: Dtype, device: &Device)->Result<Self>{
+    pub fn new(cfg:&QwenConfig, num_blocks:usize, block_size:usize, dtype: DType, device: &Device)->Result<Self>{
         let mut keys=Vec::with_capacity(cfg.num_hidden_layers);
         let mut values=Vec::with_capacity(cfg.num_hidden_layers);
         let slots=num_blocks*block_size;
