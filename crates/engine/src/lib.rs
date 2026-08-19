@@ -16,6 +16,6 @@
 //! It catches nearly every paging bug the moment it happens rather than three
 //! layers downstream as garbled output.
 pub mod sampling;
-pub mod stop; // WRITTEN BY CLAUDE — Day 2 Block 3
-pub mod detokenize;
-pub mod block; // WRITTEN BY CLAUDE — Day 3 Block 1
+pub mod stop; 
+pub mod block;
+pub mod paged_attn;
