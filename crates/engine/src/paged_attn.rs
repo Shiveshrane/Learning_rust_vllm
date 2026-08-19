@@ -68,6 +68,12 @@ pub struct PagedStore<'a>{
     pool:&'a KVPool,
     table:&'a BlockTable,
 }
+impl<'a> PagedStore<'a>{
+    pub fn new(pool:&'a KVPool, table:&'a BlockTable)->Self{
+        Self{pool, table}
+    }
+}
+
 impl KVStore for PagedStore<'_>{
     fn write(&self, layer:usize, start_pos:usize, keys:&Tensor, values:&Tensor)->Result<()>{
         self.pool.write(layer, self.table, start_pos, keys, values)
