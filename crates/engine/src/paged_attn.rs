@@ -8,6 +8,7 @@ pub struct KVPool{
     values: Vec<Tensor>,
     block_size: usize,
     num_blocks: usize,
+    device: Device,
 }
 
 
@@ -19,12 +20,12 @@ impl KVPool{
         let kv_heads=cfg.num_key_value_heads;
         let head_dim=cfg.head_dim();
         for _ in 0..cfg.num_hidden_layers{
-            let k=Tensor::zeros([&slots, kv_heads, head_dim], dtype, device)?;
-            let v=Tensor::zeros([&slots, kv_heads, head_dim], dtype, device)?;
+            let k=Tensor::zeros(&[slots, kv_heads, head_dim], dtype, device)?;
+            let v=Tensor::zeros(&[slots, kv_heads, head_dim], dtype, device)?;
             keys.push(k);
             values.push(v);
         }
-        Ok(Self { keys, values, block_size, num_blocks })
+        Ok(Self { keys, values, block_size, num_blocks, device: device.clone() })
     }
     fn slot_of(&self, table:&BlockTable, pos:usize)->usize{
         let (block, slot)=table.locate(pos);
@@ -46,7 +47,7 @@ impl KVPool{
         let idx:Vec<u32>=(0..len).map(|i| self.slot_of(table, i) as u32).collect();
         let idx=Tensor::new(idx.as_slice(), &self.device)?;
 
-        let pick=|pool:&Tensor|{
+        let pick=|pool:&Tensor|->Result<Tensor>{
             Ok(pool
             .index_select(&idx, 0)?
             .transpose(0,1)?
