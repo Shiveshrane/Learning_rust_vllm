@@ -1,3 +1,4 @@
+use qwen::config::QwenConfig;
 pub struct BlockAllocator{
     total:usize,
     free:Vec<u32>,
@@ -72,6 +73,11 @@ impl BlockTable{
     }
 }
 
+
+pub fn blocks_for_budget(budget_bytes:usize, cfg:&QwenConfig, block_size:usize, dtype_bytes:usize)->usize{
+
+    budget_bytes/(cfg.kv_bytes_per_token(dtype_bytes)*block_size)
+}
 // ===========================================================================
 // WRITTEN BY CLAUDE — Day 3 Block 1, block allocator and block table tests.
 //
@@ -311,5 +317,91 @@ mod tests {
             }
         }
         assert_eq!(alloc.free_count(), 0, "all 32 blocks should be handed out");
+    }
+
+    // ---- pool sizing ------------------------------------------------------
+
+    // WRITTEN BY CLAUDE — Day 3 Block 1, blocks_for_budget tests.
+    //
+    // Needs a real QwenConfig, so it reads config.json out of the HF cache.
+    // No weights are loaded — this stays a milliseconds-scale test.
+
+    fn cfg() -> QwenConfig {
+        let path = qwen::paths::ModelPaths::from_cache().expect("model in HF cache");
+        QwenConfig::from_path(&path.config).expect("config.json")
+    }
+
+    /// The sizing arithmetic the pool is built from. F32 KV costs 57,344
+    /// bytes/token on this checkpoint — double the 28,672 the README quotes,
+    /// because that figure assumes bf16.
+    #[test]
+    fn budget_divides_into_blocks() {
+        let c = cfg();
+        assert_eq!(c.kv_bytes_per_token(4), 57_344, "F32 KV per token");
+        assert_eq!(c.kv_bytes_per_token(2), 28_672, "bf16 KV per token");
+
+        // One block of 16 tokens, across all 28 layers.
+        let f32_block = 57_344 * 16;
+        assert_eq!(f32_block, 917_504);
+
+        let budget = 15_000_000_000usize; // ~15 GB of KV headroom
+        assert_eq!(blocks_for_budget(budget, &c, 16, 4), budget / f32_block);
+        assert_eq!(blocks_for_budget(budget, &c, 16, 4), 16_348);
+    }
+
+    /// Halving the element width doubles the pool. This is the whole argument
+    /// for bf16 KV on Day 4, in one assertion.
+    #[test]
+    fn halving_dtype_width_doubles_the_pool() {
+        let c = cfg();
+        let budget = 15_000_000_000usize;
+        let wide = blocks_for_budget(budget, &c, 16, 4);
+        let narrow = blocks_for_budget(budget, &c, 16, 2);
+        // Not exactly 2x: integer division truncates, and the wider dtype
+        // throws away more of the remainder. Within one block.
+        assert!(narrow >= wide * 2, "bf16 must hold at least twice as much");
+        assert!(narrow - wide * 2 <= 1, "and no more than that, give or take truncation");
+    }
+
+    /// Bigger blocks mean fewer of them, and the product stays put: the pool
+    /// holds the same number of TOKENS either way. Block size trades internal
+    /// fragmentation against block-table length, not capacity.
+    #[test]
+    fn block_size_trades_count_for_size_not_capacity() {
+        let c = cfg();
+        let budget = 15_000_000_000usize;
+        let tokens = |bs: usize| blocks_for_budget(budget, &c, bs, 4) * bs;
+
+        assert_eq!(blocks_for_budget(budget, &c, 32, 4), blocks_for_budget(budget, &c, 16, 4) / 2);
+        // Equal to within one block's worth of truncation.
+        assert!(tokens(16).abs_diff(tokens(32)) <= 32);
+        assert!(tokens(16).abs_diff(tokens(8)) <= 32);
+    }
+
+    /// The comparison Day 3 exists to make. Day 2 pinned max_seq=4096 per
+    /// sequence; paging hands out 16-token blocks on demand instead.
+    #[test]
+    fn paging_beats_preallocation_by_two_orders_of_magnitude() {
+        let c = cfg();
+        let budget = 15_000_000_000usize;
+
+        let day2_sequences = budget / (c.kv_bytes_per_token(4) * 4096);
+        let day3_tokens = blocks_for_budget(budget, &c, 16, 4) * 16;
+
+        assert_eq!(day2_sequences, 63, "Day 2: whole sequences, most of it wasted");
+        assert!(
+            day3_tokens > day2_sequences * 4096,
+            "paging must not hold fewer tokens than preallocation"
+        );
+        // A 50-token request costs 4 blocks instead of 4096 tokens of reservation.
+        assert_eq!(BlockTable::new(BS).blocks_needed(50), 4);
+    }
+
+    #[test]
+    fn tiny_budget_yields_no_blocks() {
+        let c = cfg();
+        assert_eq!(blocks_for_budget(0, &c, 16, 4), 0);
+        assert_eq!(blocks_for_budget(917_503, &c, 16, 4), 0, "one byte short of a block");
+        assert_eq!(blocks_for_budget(917_504, &c, 16, 4), 1);
     }
 }
