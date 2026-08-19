@@ -19,8 +19,8 @@ impl KVPool{
         let kv_heads=cfg.num_key_value_heads;
         let head_dim=cfg.head_dim();
         for _ in 0..cfg.num_hidden_layers{
-            let k=Tensor::zeros(&slots, kv_heads, head_dim], dtype, device)?;
-            let v=Tensor::zeros(&slots, kv_heads, head_dim], dtype, device)?;
+            let k=Tensor::zeros([&slots, kv_heads, head_dim], dtype, device)?;
+            let v=Tensor::zeros([&slots, kv_heads, head_dim], dtype, device)?;
             keys.push(k);
             values.push(v);
         }
