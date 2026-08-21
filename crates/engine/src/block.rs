@@ -36,6 +36,9 @@ impl BlockAllocator{
     pub fn can_allocate(&self, n:usize)->bool{
         self.free.len()>=n
     }
+    pub fn total_blocks(&self)->usize{
+        self.total
+    }
 }
 
 impl BlockTable{

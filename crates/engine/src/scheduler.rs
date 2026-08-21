@@ -120,4 +120,47 @@ pub struct Scheduler{
     next_id:u64,
 }
 
+impl Scheduler{
+    pub fn new(pool:KVPool, block_size:usize)->Self{
+        let alloc=BlockAllocator::new(pool.num_blocks());
+        Self{
+            waiting:VecDeque::new(),
+            running:Vec::new(),
+            pool,
+            alloc,
+            block_size,
+            next_id:0,
+        }
+    }
+    pub fn admit(&mut self, job:Job, tok:&Tokenizer, vocab_size:usize, eos:usize)->Result<()>{
+        let mut seq=Sequence::new(job, self.block_size);
+        let id=self.next_id;
+        self.next_id+=1;
+        let tx=job.tx.clone();
 
+        match seq{
+            Ok(seq){
+                self.waiting.push_back(seq);
+                Ok(id)
+            }
+            Err(e)=>{
+                let _=tx.send(Event::Error(format!("Failed to create sequence: {e}")));
+                Err(e)
+            }
+        }
+
+    }
+
+    pub fn check_invariant(&self){
+        let held:usize:self.running.iter().map(|s| s.table.len_blocks())
+        .sum::<usize>()
+        +self.waiting.iter().map(|s| s.table.len_blocks())
+        .sum::<usize>();
+
+        debug_assert_eq!(
+            self.alloc.free_count()+held,
+            self.alloc.total_blocks(),
+            "Block accounting broken"
+        );
+    }
+}
