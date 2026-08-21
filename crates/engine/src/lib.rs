@@ -20,3 +20,4 @@ pub mod stop;
 pub mod detokenize;
 pub mod block;
 pub mod paged_attn;
+pub mod scheduler;

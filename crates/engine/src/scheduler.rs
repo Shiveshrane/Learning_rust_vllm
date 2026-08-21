@@ -40,16 +40,9 @@ struct Sequence{
     table:BlockTable,
     sampler:Sampler,
     stopper:Stopper,
-    detok:/* per-sequence */,
+    emitted: usize,
     tx: mpsc::UnboundedSender<Event>,
     state:State,
-}
-
-struct Scheduler{
-    waiting:VecDeque<Sequence>,
-    running:Vec<Sequence>,
-    pool:KVPool,
-    alloc:BlockAllocator,
 }
 
 impl Sequence{
@@ -139,7 +132,7 @@ impl Scheduler{
         let tx=job.tx.clone();
 
         match seq{
-            Ok(seq){
+            Ok(seq)=>{
                 self.waiting.push_back(seq);
                 Ok(id)
             }
@@ -152,7 +145,7 @@ impl Scheduler{
     }
 
     pub fn check_invariant(&self){
-        let held:usize:self.running.iter().map(|s| s.table.len_blocks())
+        let held:usize=self.running.iter().map(|s| s.table.len_blocks())
         .sum::<usize>()
         +self.waiting.iter().map(|s| s.table.len_blocks())
         .sum::<usize>();
