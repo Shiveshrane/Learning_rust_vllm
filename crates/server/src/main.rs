@@ -4,7 +4,8 @@ mod worker;
 use axum::{extract::State, http::StatusCode, routing::{get, post}, Router, Json};
 use api::{CompletionRequest, CompletionResponse, Usage};
 use axum::response::{sse::Event as SseEvent, IntoResponse, Response, Sse};
-use worker::{Event, Job};
+use engine::sampling::Params;
+use engine::scheduler::{Event, Job, Request};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::{Stream, StreamExt};
@@ -81,7 +82,25 @@ async fn completions(State(st):State<AppState>,Json(req):Json<CompletionRequest>
     // }
     // Err((StatusCode::INTERNAL_SERVER_ERROR, "worker closed".into()))
 
-    if st.jobs.send(Job {req, tx}).is_err(){
+    // The layering boundary: serde/axum types stay in `server`, the engine
+    // receives plain data. This is the only place the two vocabularies meet.
+    let job = Job {
+        req: Request {
+            prompt: req.prompt,
+            max_tokens: req.max_tokens,
+            params: Params {
+                temperature: req.temperature,
+                top_k: req.top_k,
+                top_p: req.top_p,
+                min_prob: req.min_prob,
+                repetition_penalty: req.repeat_penalty,
+                seed: req.seed,
+            },
+            stop: req.stop,
+        },
+        tx,
+    };
+    if st.jobs.send(job).is_err(){
         return (StatusCode::SERVICE_UNAVAILABLE, "worker gone").into_response();
     }
     if stream{

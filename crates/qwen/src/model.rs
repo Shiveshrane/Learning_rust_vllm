@@ -2,7 +2,7 @@ use anyhow::Result;
 use candle_core::{DType, Device, Tensor, D};
 use candle_nn::{embedding, linear, linear_no_bias, Embedding, Linear, Module, VarBuilder};
 use candle_nn::ops::sdpa;
-use crate::cache::{KVCache, KVStore};
+use crate::cache::{BatchedKvStore, KVCache, KVStore};
 use crate::config::QwenConfig;
 
 
@@ -76,6 +76,21 @@ impl RoPE{
         })
     }
 
+
+    pub fn apply_at(&self, x:&Tensor, pos:&Tensor)-> Result<Tensor>{
+        let (b, _h, s, d)=x.dims4()?;
+        debug_assert_eq!(s, 1, "apply_at is the single-token decode path");
+        let half=d/2;
+        // [B, half] -> [B, 1, 1, half] so it broadcasts across heads.
+        let cos=self.cos.index_select(pos, 0)?.reshape((b, 1, 1, half))?;
+        let sin=self.sin.index_select(pos, 0)?.reshape((b, 1, 1, half))?;
+        let x1=x.narrow(D::Minus1, 0, half)?.to_dtype(DType::F32)?;
+        let x2=x.narrow(D::Minus1, half, half)?.to_dtype(DType::F32)?;
+        let r1=((x1.broadcast_mul(&cos)?) - (x2.broadcast_mul(&sin)?))?;
+        let r2=((x1.broadcast_mul(&sin)?) + (x2.broadcast_mul(&cos)?))?;
+        Ok(Tensor::cat(&[r1, r2], D::Minus1)?.to_dtype(x.dtype())?)
+    }
+
     pub fn apply(&self, x:&Tensor, offset: usize)-> Result<Tensor>{
         let (_b, _h, s, d)=x.dims4()?;
         let half=d/2;
@@ -132,6 +147,53 @@ impl Attention{
         .expand((b, kv_h, self.kv_groups, s, d))?
         .contiguous()?
         .reshape((b, kv_h*self.kv_groups, s, d))?)
+    }
+
+    pub fn forward_batch(
+        &self,
+        x:&Tensor,                       // [B, 1, hidden]
+        rope:&RoPE,
+        store:&dyn BatchedKvStore,
+        layer:usize,
+        pos_ids:&Tensor,                 // [B] u32
+        mask:&Tensor,                    // [B, num_heads, 1, max_len]
+    )->Result<Tensor>{
+        let (b, s, _)=x.dims3()?;
+        let q=self.q_proj.forward(x)?
+            .reshape((b, s, self.num_heads, self.head_dim))?
+            .transpose(1,2)?.contiguous()?;
+        let k=self.k_proj.forward(x)?
+            .reshape((b, s, self.num_kv_heads, self.head_dim))?
+            .transpose(1,2)?.contiguous()?;
+        let v=self.v_proj.forward(x)?
+            .reshape((b, s, self.num_kv_heads, self.head_dim))?
+            .transpose(1,2)?.contiguous()?;
+
+        let q=rope.apply_at(&q, pos_ids)?;
+        let k=rope.apply_at(&k, pos_ids)?;
+
+        store.write_batch(layer, &k, &v)?;
+        let (k, v)=store.gather_batch(layer)?;
+
+        // NOT sdpa. On Metal, q_seq == 1 takes the vectorized kernel
+        // (`supports_sdpa_vector`), and `call_sdpa_vector` accepts no mask
+        // argument — masks are silently ignored there. Batched decode pads
+        // shorter sequences, and padding must be masked: a zero key is not
+        // neutral, exp(q.0) = 1 gives it real attention weight.
+        //
+        // So attention is hand-rolled here. The batching win is in the
+        // projections and the MLP, which is where the 3.5GB of weights live.
+        let k=repeat_kv(&k, self.kv_groups)?;
+        let v=repeat_kv(&v, self.kv_groups)?;
+        let scores=q.matmul(&k.transpose(2,3)?.contiguous()?)?;
+        let scores=scores.affine(self.scale, 0.0)?;
+        let scores=scores.broadcast_add(mask)?;
+        let probs=candle_nn::ops::softmax_last_dim(&scores.to_dtype(DType::F32)?)?
+            .to_dtype(scores.dtype())?;
+        let out=probs.matmul(&v)?;
+        let out=out.transpose(1,2)?.contiguous()?
+            .reshape((b, s, self.num_heads*self.head_dim))?;
+        Ok(self.o_proj.forward(&out)?)
     }
 
     pub fn forward(&self, 
@@ -199,6 +261,23 @@ impl DecoderLayer{
         })
 
     }
+    pub fn forward_batch(
+        &self,
+        x:&Tensor,
+        rope:&RoPE,
+        store:&dyn BatchedKvStore,
+        layer:usize,
+        pos_ids:&Tensor,
+        mask:&Tensor,
+    )->Result<Tensor>{
+        let residual=self.input_layernorm.forward(x)?;
+        let residual=self.self_attention.forward_batch(&residual, rope, store, layer, pos_ids, mask)?;
+        let x=(x+residual)?;
+        let residual=self.post_attention_layernorm.forward(&x)?;
+        let residual=self.mlp.forward(&residual)?;
+        Ok((x+residual)?)
+    }
+
     pub fn forward(&self, 
         x: &Tensor, 
         rope: &RoPE, 
@@ -216,6 +295,19 @@ impl DecoderLayer{
     }
 
 
+}
+
+/// Expand KV heads to match query heads for the hand-rolled matmul.
+/// `sdpa` does this internally; the manual path needs it materialised.
+fn repeat_kv(x:&Tensor, groups:usize)->Result<Tensor>{
+    if groups==1{
+        return Ok(x.clone());
+    }
+    let (b, kv_h, s, d)=x.dims4()?;
+    Ok(x.unsqueeze(2)?
+        .expand((b, kv_h, groups, s, d))?
+        .contiguous()?
+        .reshape((b, kv_h*groups, s, d))?)
 }
 
 fn causal_mask(s:usize, offset:usize, dtype: DType, device:&Device)->Result<Tensor>{
@@ -321,6 +413,45 @@ impl Qwen2{
         Ok(self.lm_head.forward(&h)?)
     }
 
+
+    /// One decode step for a whole batch: B sequences advance together, reading
+    /// the weights ONCE instead of once each. That is the bandwidth win that
+    /// makes an inference server worth writing rather than a generate() loop.
+    ///
+    /// `input_ids`: [B, 1] — the token each sequence just sampled.
+    pub fn forward_decode_batch(
+        &self,
+        input_ids:&Tensor,
+        store:&dyn BatchedKvStore,
+    )->Result<Tensor>{
+        let (b, _s)=input_ids.dims2()?;
+        let lens=store.lens();
+        let max_len=lens.iter().copied().max().unwrap_or(0);
+        let num_heads=self.layers[0].self_attention.num_heads;
+
+        // Sequences have different histories, so the gather is padded. Mask it:
+        // element i may attend to 0..lens[i] and nothing beyond.
+        let mut m=Vec::with_capacity(b*max_len);
+        for &l in lens{
+            for j in 0..max_len{
+                m.push(if j<l {0f32} else {f32::NEG_INFINITY});
+            }
+        }
+        // Stride-0 expand over the head axis: sdpa checks dims, honours strides.
+        let mask=Tensor::from_vec(m, (b, 1, 1, max_len), &self.device)?
+            .to_dtype(self.dtype)?
+            .expand((b, num_heads, 1, max_len))?
+            .contiguous()?;
+
+        let pos_ids=Tensor::new(store.positions(), &self.device)?;
+
+        let mut h=self.embedding.forward(input_ids)?;
+        for (i, layer) in self.layers.iter().enumerate(){
+            h=layer.forward_batch(&h, &self.rope, store, i, &pos_ids, &mask)?;
+        }
+        let h=self.final_layernorm.forward(&h)?;
+        Ok(self.lm_head.forward(&h)?)
+    }
 
     pub fn forward_decode(
         &self, 

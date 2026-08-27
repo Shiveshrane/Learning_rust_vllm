@@ -3,7 +3,7 @@ use crate::block::{BlockAllocator, BlockTable};
 use crate::sampling::{Params, Sampler};
 use crate::stop::{StopReason, Stopper};
 use tokio::sync::mpsc;
-use crate::paged_attn::{KVPool, PagedStore};
+use crate::paged_attn::{BatchedPagedStore, KVPool, PagedStore};
 use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor};
 use qwen::model::Qwen2;
@@ -100,8 +100,6 @@ impl Sequence{
         let text=tok
                 .decode(&self.tokens[self.prompt_len..], false)
                 .map_err(anyhow::Error::from_boxed)?;
-        // U+FFFD, three Fs. U+0FFD is a different character entirely and
-        // would make this branch dead, silently emitting partial chars.
         if text.ends_with('\u{FFFD}'){
             return Ok(String::new());
         }
@@ -115,12 +113,16 @@ impl Sequence{
         }
     }
 
+    /// Recompute preemption: drop the KV, keep everything else.
+    ///
+    /// `tokens` and `emitted` are deliberately untouched. Text already sent to
+    /// the client cannot be unsent, so rewinding them makes the sequence
+    /// regenerate and re-emit its own prefix. Re-prefill runs over the full
+    /// prompt-plus-generated sequence instead.
     fn preempt(&mut self, alloc:&mut BlockAllocator){
         self.release(alloc);
         self.state=State::Waiting;
-        self.tokens.truncate(self.prompt_len);
         self.pos=0;
-        self.emitted=0;
     }
 
 }
@@ -150,8 +152,6 @@ impl Scheduler{
     pub fn admit(&mut self, job:Job, tok:&tokenizers::Tokenizer, vocab_size:usize, eos:u32)->Result<u64>{
         let id=self.next_id;
         self.next_id+=1;
-        // Clone before `job` moves, so a failed encode is reported
-        // instead of silently closing the client's stream.
         let tx=job.tx.clone();
         let seq=Sequence::new(id, job, self.block_size, tok, vocab_size, eos);
         match seq{
@@ -165,6 +165,9 @@ impl Scheduler{
             }
         }
 
+    }
+    pub fn is_idle(&self)->bool{
+        self.waiting.is_empty() && self.running.is_empty()
     }
 
     pub fn check_invariant(&self){
@@ -217,9 +220,18 @@ impl Scheduler{
         Ok(())
     }
 
-    fn decode (&mut self, model:&qwen::model::Qwen2, tok:&tokenizers::Tokenizer, device:&Device)->Result<()>{
+    /// One decode step for EVERY running sequence, in a single forward pass.
+    ///
+    /// Day 3's first version looped and called forward_decode per sequence,
+    /// which re-read all 3.5GB of weights once per sequence per iteration and
+    /// gave zero throughput scaling. Batching reads them once.
+    fn decode(&mut self, model:&qwen::model::Qwen2, tok:&tokenizers::Tokenizer, device:&Device)->Result<()>{
+        // ---- phase 1: sample, emit, and decide who continues ---------------
+        let mut active:Vec<usize>=Vec::new();   // indices into self.running
+        let mut next_tokens:Vec<u32>=Vec::new();
         let mut preempt_ids:Vec<u64>=Vec::new();
-        for seq in self.running.iter_mut(){
+
+        for (i, seq) in self.running.iter_mut().enumerate(){
             let Some(last)=seq.last.as_ref() else {continue};
             let top=seq.sampler.sample(last, &seq.tokens)?;
 
@@ -235,22 +247,49 @@ impl Scheduler{
                 seq.finish=Some(reason);
                 seq.state=State::Finished;
                 continue;
+            }
+            active.push(i);
+            next_tokens.push(top);
+        }
+        if active.is_empty(){
+            return Ok(());
         }
 
-        if !seq.ensure_blocks(&mut self.alloc, seq.pos+1){
-            preempt_ids.push(seq.id);
-            continue;
+        // ---- phase 2: grow block tables BEFORE any KV is written ----------
+        let mut batch:Vec<usize>=Vec::new();
+        let mut batch_tokens:Vec<u32>=Vec::new();
+        for (k, &i) in active.iter().enumerate(){
+            let need=self.running[i].pos+1;
+            if self.running[i].ensure_blocks(&mut self.alloc, need){
+                batch.push(i);
+                batch_tokens.push(next_tokens[k]);
+            }else{
+                // Pool exhausted: this one sits out and re-prefills later.
+                preempt_ids.push(self.running[i].id);
+            }
         }
-        let inp=Tensor::new(&[top], device)?.unsqueeze(0)?;
-        let logits={
-            let store=PagedStore::new(&self.pool, &seq.table);
-            model.forward_decode(&inp, &store, seq.pos)?
-        };
-        seq.last=Some(logits.i((0,0))?.to_dtype(DType::F32)?);
-        seq.pos+=1;
-    }
-    self.preempt(&preempt_ids);
-    Ok(())
+        if batch.is_empty(){
+            self.preempt(&preempt_ids);
+            return Ok(());
+        }
+
+        // ---- phase 3: ONE forward for the whole batch ---------------------
+        let tables:Vec<&BlockTable>=batch.iter().map(|&i| &self.running[i].table).collect();
+        let write_pos:Vec<usize>=batch.iter().map(|&i| self.running[i].pos).collect();
+        let store=BatchedPagedStore::new(&self.pool, tables, write_pos);
+
+        let input=Tensor::new(batch_tokens.as_slice(), device)?
+            .reshape((batch.len(), 1))?;
+        let logits=model.forward_decode_batch(&input, &store)?;
+
+        for (row, &i) in batch.iter().enumerate(){
+            let seq=&mut self.running[i];
+            seq.last=Some(logits.i((row, 0))?.to_dtype(DType::F32)?);
+            seq.pos+=1;
+        }
+
+        self.preempt(&preempt_ids);
+        Ok(())
     }
 
     fn preempt(&mut self, ids:&[u64]){
@@ -465,30 +504,34 @@ mod tests {
 
     /// Preemption is recompute: KV dropped, prompt kept, position and emitted
     /// byte count rewound. Forgetting `emitted = 0` would silently truncate the
-    /// client's output when the sequence resumes.
+    /// Preemption is recompute: the KV is dropped, everything else survives.
+    ///
+    /// Rewinding `tokens` or `emitted` here makes the sequence regenerate text
+    /// the client already received and emit it twice. Caught by
+    /// tests/scheduler_gate.rs, which saw the generated prefix duplicated.
     #[test]
-    fn preempt_rewinds_to_the_prompt() {
+    fn preempt_drops_kv_but_keeps_progress() {
         let tok = tokenizer();
         let mut s = scheduler(8);
         let (j, _rx) = job("The capital of France is");
         s.admit(j, &tok, tok.get_vocab_size(true), EOS).unwrap();
         let mut seq = s.waiting.pop_front().unwrap();
 
-        // Simulate having generated a few tokens.
         seq.ensure_blocks(&mut s.alloc, 12);
         seq.tokens.extend_from_slice(&[12095, 11, 323]);
         seq.pos = 8;
         seq.emitted = 17;
         seq.state = State::Running;
+        let tokens_before = seq.tokens.clone();
 
         seq.preempt(&mut s.alloc);
 
         assert_eq!(s.alloc.free_count(), 8, "preemption must free every block");
-        assert_eq!(seq.tokens.len(), seq.prompt_len, "generated tokens dropped");
-        assert_eq!(seq.pos, 0, "position rewound for re-prefill");
-        assert_eq!(seq.emitted, 0, "emitted byte count must rewind too");
-        assert!(matches!(seq.state, State::Waiting));
         assert_eq!(seq.table.len_blocks(), 0);
+        assert_eq!(seq.pos, 0, "position rewound so prefill recomputes the KV");
+        assert!(matches!(seq.state, State::Waiting));
+        assert_eq!(seq.tokens, tokens_before, "generated tokens must survive");
+        assert_eq!(seq.emitted, 17, "already-emitted byte count must survive");
     }
 
     // ---- the invariant ----------------------------------------------------

@@ -16,6 +16,23 @@ pub trait KVStore{
     fn gather(&self, layer:usize, len:usize)->Result<(Tensor, Tensor)>;
 }
 
+/// Batched decode: one token per sequence, each at its own position, each with
+/// its own KV history. Implemented in `engine` over many block tables sharing
+/// one pool — `qwen` cannot import `engine`, so the model declares what it needs.
+///
+/// Sequences have different lengths, so `gather_batch` pads to the longest and
+/// `lens` says where each one really ends; the caller masks the padding.
+pub trait BatchedKvStore{
+    /// Write one token per batch element. `k`/`v`: [B, kv_heads, 1, head_dim].
+    fn write_batch(&self, layer:usize, k:&Tensor, v:&Tensor)->Result<()>;
+    /// All sequences padded to `max_len`: [B, kv_heads, max_len, head_dim].
+    fn gather_batch(&self, layer:usize)->Result<(Tensor, Tensor)>;
+    /// True KV length of each sequence, after this step's write.
+    fn lens(&self)->&[usize];
+    /// Position to rotate each batch element by. Equals `lens[i] - 1`.
+    fn positions(&self)->&[u32];
+}
+
 impl KVCache{
     pub fn new(cfg:&QwenConfig, max_seq:usize, dtype:DType, device:&Device)->Result<Self>{
         let n_layers=cfg.num_hidden_layers;

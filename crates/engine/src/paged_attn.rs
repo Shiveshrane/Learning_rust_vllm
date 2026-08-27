@@ -300,3 +300,70 @@ mod tests {
         assert_eq!(flat(&p.gather(0, &table, len).unwrap().0), flat(&new));
     }
 }
+
+/// Many sequences, one pool, one forward pass.
+///
+/// `PagedStore` binds ONE block table for a single-sequence forward. This binds
+/// B of them, so a decode step reads the weights once for the whole batch
+/// instead of once per sequence — the whole point of continuous batching.
+///
+/// Sequences have different lengths, so `gather_batch` pads to the longest and
+/// `lens` tells the caller where each really ends.
+pub struct BatchedPagedStore<'a>{
+    pool:&'a KVPool,
+    tables:Vec<&'a BlockTable>,
+    /// Write slot for this step, per sequence (== length before the write).
+    write_pos:Vec<usize>,
+    /// KV length after this step's write, per sequence.
+    lens:Vec<usize>,
+    /// RoPE position per sequence == write_pos.
+    positions:Vec<u32>,
+    max_len:usize,
+}
+
+impl<'a> BatchedPagedStore<'a>{
+    /// `write_pos[i]` is where sequence i's new token goes; its KV then spans
+    /// 0..write_pos[i]+1.
+    pub fn new(pool:&'a KVPool, tables:Vec<&'a BlockTable>, write_pos:Vec<usize>)->Self{
+        let lens:Vec<usize>=write_pos.iter().map(|p| p+1).collect();
+        let positions:Vec<u32>=write_pos.iter().map(|p| *p as u32).collect();
+        let max_len=lens.iter().copied().max().unwrap_or(0);
+        Self{pool, tables, write_pos, lens, positions, max_len}
+    }
+}
+
+impl qwen::cache::BatchedKvStore for BatchedPagedStore<'_>{
+    fn write_batch(&self, layer:usize, k:&Tensor, v:&Tensor)->Result<()>{
+        for (i, table) in self.tables.iter().enumerate(){
+            // Slice this sequence's row back out: [1, kv_heads, 1, head_dim].
+            let ki=k.narrow(0, i, 1)?.contiguous()?;
+            let vi=v.narrow(0, i, 1)?.contiguous()?;
+            self.pool.write(layer, table, self.write_pos[i], &ki, &vi)?;
+        }
+        Ok(())
+    }
+
+    fn gather_batch(&self, layer:usize)->Result<(Tensor, Tensor)>{
+        let mut ks=Vec::with_capacity(self.tables.len());
+        let mut vs=Vec::with_capacity(self.tables.len());
+        for (i, table) in self.tables.iter().enumerate(){
+            let (k, v)=self.pool.gather(layer, table, self.lens[i])?;
+            // Pad the tail so every sequence is max_len long. The padding is
+            // never read: forward_decode_batch masks j >= lens[i] with -inf.
+            let pad=self.max_len-self.lens[i];
+            if pad>0{
+                let (b, h, _l, d)=k.dims4()?;
+                let zeros=Tensor::zeros((b, h, pad, d), k.dtype(), k.device())?;
+                ks.push(Tensor::cat(&[k, zeros.clone()], 2)?);
+                vs.push(Tensor::cat(&[v, zeros], 2)?);
+            }else{
+                ks.push(k);
+                vs.push(v);
+            }
+        }
+        Ok((Tensor::cat(&ks, 0)?.contiguous()?, Tensor::cat(&vs, 0)?.contiguous()?))
+    }
+
+    fn lens(&self)->&[usize]{ &self.lens }
+    fn positions(&self)->&[u32]{ &self.positions }
+}
