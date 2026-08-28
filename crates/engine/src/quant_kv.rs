@@ -7,6 +7,15 @@ pub enum KVDType{
     Int8,
 }
 
+impl KVDType{
+    pub fn bytes_per_token(&self, cfg:&qwen::config::QwenConfig)->usize{
+        match self{
+            KVDType::F32=>cfg.kv_bytes_per_token(4),
+            KVDType::Int8=>cfg.kv_bytes_per_token(1)+2*cfg.num_hidden_layers*cfg.num_key_value_heads*4,
+        }
+    }
+}
+
 
 const MIN_SCALE:f64=1e-12;
 
@@ -31,6 +40,48 @@ pub fn dequantize_token(codes:&Tensor, scale:&Tensor)->Result<Tensor>{
     .broadcast_mul(scale)?;
     Ok(x)
 }
+
+pub fn quantize_per_channel(x:&Tensor)->Result<(Tensor, Tensor)>{
+    let scale=x.abs()?.max_keepdim(0)?
+    .affine(1.0/127.0, 0.0)?
+    .clamp(MIN_SCALE, f64::INFINITY)?;
+
+
+    let codes=x.broadcast_div(&scale)?
+    .round()?
+    .clamp(-127.0, 127.0)?
+    .affine(1.0, 128.0)?
+    .to_dtype(DType::U8)?;
+
+    Ok((codes, scale))
+}
+
+pub fn dequantize_per_channel(codes:&Tensor, scale:&Tensor)->Result<Tensor>{
+    let x=codes.to_dtype(DType::F32)?
+    .affine(1.0, -128.0)?
+    .broadcast_mul(scale)?;
+    Ok(x)
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -171,5 +222,139 @@ mod tests {
         assert_eq!(q.dims(), &[2, 3, 4]);
         assert_eq!(s.dims(), &[2, 3, 1], "one scale per (slot, head)");
         assert_eq!(dequantize_token(&q, &s).unwrap().dims(), &[2, 3, 4]);
+    }
+
+    // ---- per-channel grouping ---------------------------------------------
+    //
+    // TESTS WRITTEN BY CLAUDE — Day 4 Block 1, step 2.
+    //
+    // Real key tensors have persistent per-channel outliers: specific dims of
+    // the head are consistently far larger, across every token. This builds
+    // exactly that shape and shows why the grouping axis decides the outcome.
+
+    /// A block of 8 tokens x 2 heads x 6 channels, where channel 3 is 100x its
+    /// neighbours in every token — the structure keys actually have.
+    fn channel_outlier_block() -> Tensor {
+        let (tokens, heads, chans) = (8usize, 2usize, 6usize);
+        let mut v = Vec::with_capacity(tokens * heads * chans);
+        for t in 0..tokens {
+            for h in 0..heads {
+                for c in 0..chans {
+                    let base = 1.0 + (t as f32) * 0.1 + (h as f32) * 0.05 + (c as f32) * 0.01;
+                    v.push(if c == 3 { base * 100.0 } else { base });
+                }
+            }
+        }
+        Tensor::from_vec(v, (tokens, heads, chans), &Device::Cpu).unwrap()
+    }
+
+    fn max_err(a: &Tensor, b: &Tensor) -> f32 {
+        (a - b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .fold(0f32, f32::max)
+    }
+
+    /// The whole reason per-channel exists. Same data, same bit width, only the
+    /// grouping axis differs — and the well-behaved channels stop being poisoned
+    /// by the outlier channel.
+    #[test]
+    fn per_channel_beats_per_token_on_channel_outliers() {
+        let x = channel_outlier_block();
+
+        let (qt, st) = quantize_token(&x).unwrap();
+        let per_token = dequantize_token(&qt, &st).unwrap();
+
+        let (qc, sc) = quantize_per_channel(&x).unwrap();
+        let per_channel = dequantize_per_channel(&qc, &sc).unwrap();
+
+        // Error on the QUIET channels only: index 3 is the outlier itself,
+        // which both schemes reproduce fine because it sets its own scale.
+        let quiet = |y: &Tensor| -> f32 {
+            let a = x.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let b = y.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            a.iter()
+                .zip(&b)
+                .enumerate()
+                .filter(|(i, _)| i % 6 != 3)
+                .map(|(_, (p, q))| (p - q).abs())
+                .fold(0f32, f32::max)
+        };
+
+        let e_token = quiet(&per_token);
+        let e_channel = quiet(&per_channel);
+        println!("\n  quiet-channel max err, per-token  : {e_token:.6}");
+        println!("  quiet-channel max err, per-channel: {e_channel:.6}");
+        println!("  improvement: {:.0}x", e_token / e_channel.max(1e-9));
+
+        assert!(
+            e_channel * 20.0 < e_token,
+            "per-channel should be far better here: {e_channel} vs {e_token}"
+        );
+        // The trade: per-channel shares the loud channel's scale across tokens
+        // of differing magnitude, so the OUTLIER itself reconstructs slightly
+        // worse than per-token, where each token's scale is set by its own
+        // outlier and lands exactly on code 127. That is a good bargain: the
+        // loud channel is large, so its relative error stays tiny, and the
+        // quiet channels improve 59x.
+        let outlier_rel = {
+            let a = x.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let b = per_channel.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            a.iter()
+                .zip(&b)
+                .enumerate()
+                .filter(|(i, _)| i % 6 == 3)
+                .map(|(_, (p, q))| (p - q).abs() / p.abs())
+                .fold(0f32, f32::max)
+        };
+        println!("  outlier-channel relative err, per-channel: {:.4}%", outlier_rel * 100.0);
+        assert!(outlier_rel < 0.01, "loud channel should stay within 1% relative");
+    }
+
+    /// Scales reduce over dim 0 (tokens), so the shape keeps a leading 1 for
+    /// broadcasting — the mirror of per-token's trailing 1.
+    #[test]
+    fn per_channel_scale_has_one_entry_per_channel() {
+        let x = channel_outlier_block();
+        let (codes, scale) = quantize_per_channel(&x).unwrap();
+        assert_eq!(codes.dims(), &[8, 2, 6]);
+        assert_eq!(scale.dims(), &[1, 2, 6], "one scale per (head, channel)");
+        assert_eq!(dequantize_per_channel(&codes, &scale).unwrap().dims(), &[8, 2, 6]);
+    }
+
+    /// On data with no channel structure, the two schemes should be comparable —
+    /// per-channel is not a free win, it is a win against a specific structure.
+    #[test]
+    fn per_channel_is_not_magic_on_flat_data() {
+        let v: Vec<f32> = (0..8 * 2 * 6).map(|i| ((i * 37) % 23) as f32 - 11.0).collect();
+        let x = Tensor::from_vec(v, (8, 2, 6), &Device::Cpu).unwrap();
+
+        let (qt, st) = quantize_token(&x).unwrap();
+        let (qc, sc) = quantize_per_channel(&x).unwrap();
+        let e_token = max_err(&x, &dequantize_token(&qt, &st).unwrap());
+        let e_channel = max_err(&x, &dequantize_per_channel(&qc, &sc).unwrap());
+        println!("  flat data — per-token {e_token:.6}, per-channel {e_channel:.6}");
+        assert!(e_channel < e_token * 4.0, "should be in the same ballpark");
+    }
+
+    #[test]
+    fn per_channel_handles_an_all_zero_channel() {
+        let mut v = vec![1.0f32; 8 * 2 * 6];
+        for t in 0..8 {
+            for h in 0..2 {
+                v[(t * 2 + h) * 6 + 2] = 0.0;
+            }
+        }
+        let x = Tensor::from_vec(v, (8, 2, 6), &Device::Cpu).unwrap();
+        let (q, s) = quantize_per_channel(&x).unwrap();
+        let back = dequantize_per_channel(&q, &s).unwrap();
+        let vals = back.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(vals.iter().all(|v| v.is_finite()), "MIN_SCALE guard failed");
     }
 }

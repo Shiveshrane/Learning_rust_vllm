@@ -66,12 +66,17 @@ fn load()->Result<WorkerState>{
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2_000_000_000);
-    let num_blocks=engine::block::blocks_for_budget(budget, &cfg, BLOCK_SIZE, 4);
-    let pool=KVPool::new(&cfg, num_blocks, BLOCK_SIZE, KVDType::F32, &device)?;
+    let kv_dtype=match std::env::var("KV_DTYPE").as_deref(){
+        Ok("int8")=>KVDType::Int8,
+        _=>KVDType::F32
+    };
+    let per_token=kv_dtype.bytes_per_token(&cfg);
+    let num_blocks=budget/(per_token*BLOCK_SIZE);
+    let pool=KVPool::new(&cfg, num_blocks, BLOCK_SIZE, kv_dtype, &device)?;
     println!(
-        "KV pool: {num_blocks} blocks x {BLOCK_SIZE} tokens = {} tokens ({:.1} GB)",
+        "KV pool: {num_blocks} blocks x {BLOCK_SIZE} tokens = {} tokens ({:.1} GB, {kv_dtype:?})",
         num_blocks * BLOCK_SIZE,
-        (num_blocks * BLOCK_SIZE * cfg.kv_bytes_per_token(4)) as f64 / 1e9
+        (num_blocks * BLOCK_SIZE * per_token) as f64 / 1e9
     );
     let scheduler=Scheduler::new(pool, BLOCK_SIZE);
     let vocab_size=tok.get_vocab_size(true);

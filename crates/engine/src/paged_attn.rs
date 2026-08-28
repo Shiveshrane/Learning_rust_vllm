@@ -3,7 +3,7 @@ use crate::block::BlockTable;
 use candle_core::{DType, Device, Tensor};
 use anyhow::Result;
 use qwen::cache::KVStore;
-use crate::quant_kv::{dequantize_token, quantize_token, KVDType};
+use crate::quant_kv::{dequantize_token, quantize_token, KVDType, quantize_per_channel, dequantize_per_channel};
 pub struct KVPool{
     keys: Vec<Tensor>,
     values: Vec<Tensor>,
@@ -35,7 +35,7 @@ impl KVPool{
             keys.push(k);
             values.push(v);
             if dtype==KVDType::Int8{
-                let k_scale=Tensor::zeros(&[slots, kv_heads, 1], DType::F32, device)?;
+                let k_scale=Tensor::zeros(&[num_blocks, kv_heads, head_dim], DType::F32, device)?;
                 let v_scale=Tensor::zeros(&[slots, kv_heads, 1], DType::F32, device)?;
                 key_scales.push(k_scale);
                 val_scales.push(v_scale);
@@ -66,16 +66,37 @@ impl KVPool{
                 }
             }
             KVDType::Int8=>{
-                let (kq, ks)=quantize_token(&k3)?;   // codes [s,kvh,hd], scales [s,kvh,1]
-                let (vq, vs)=quantize_token(&v3)?;
                 let key_scales=self.key_scales.as_ref().expect("Int8 pool has key scales");
                 let val_scales=self.val_scales.as_ref().expect("Int8 pool has value scales");
+
+                let (vq, vs)=quantize_token(&v3)?;
                 for i in 0..s{
                     let dst=self.slot_of(table, start_pos+i);
-                    self.keys[layer].slice_set(&kq.narrow(0,i,1)?.contiguous()?,0, dst)?;
                     self.values[layer].slice_set(&vq.narrow(0,i,1)?.contiguous()?,0, dst)?;
-                    key_scales[layer].slice_set(&ks.narrow(0,i,1)?.contiguous()?,0, dst)?;
                     val_scales[layer].slice_set(&vs.narrow(0,i,1)?.contiguous()?,0, dst)?;
+                }
+
+                let mut i=0usize;
+                while i<s{
+                    let (block, slot)=table.locate(start_pos+i);
+                    let base=block as usize*self.block_size;
+
+                    let codes=self.keys[layer].narrow(0, base, self.block_size)?;
+                    let scale=key_scales[layer].narrow(0, block as usize, 1)?;
+                    let staged=dequantize_per_channel(&codes, &scale)?;
+
+                    let mut j=i;
+                    let mut sl=slot;
+                    while j<s && sl<self.block_size{
+                        staged.slice_set(&k3.narrow(0,j,1)?.contiguous()?, 0, sl)?;
+                        j+=1;
+                        sl+=1;
+                    }
+
+                    let (bq, bs_)=quantize_per_channel(&staged)?;
+                    self.keys[layer].slice_set(&bq.contiguous()?, 0, base)?;
+                    key_scales[layer].slice_set(&bs_.contiguous()?, 0, block as usize)?;
+                    i=j;
                 }
             }
         }
@@ -85,18 +106,29 @@ impl KVPool{
         let idx:Vec<u32>=(0..len).map(|i| self.slot_of(table, i) as u32).collect();
         let idx=Tensor::new(idx.as_slice(), &self.device)?;
 
-        let pick=|pool:&Tensor, scales:Option<&Tensor>|->Result<Tensor>{
-            let picked=pool.index_select(&idx, 0)?;
-            let x=match scales{
-                None=>picked,
-                Some(sc)=>dequantize_token(&picked, &sc.index_select(&idx, 0)?)?,
-            };
+        let finish=|x:Tensor|->Result<Tensor>{
             Ok(x.transpose(0,1)?.contiguous()?.unsqueeze(0)?)
         };
 
-        let ks=self.key_scales.as_ref().map(|v| &v[layer]);
-        let vs=self.val_scales.as_ref().map(|v| &v[layer]);
-        Ok((pick(&self.keys[layer], ks)?, pick(&self.values[layer], vs)?))
+        let k=match self.key_scales.as_ref(){
+            None=>finish(self.keys[layer].index_select(&idx, 0)?)?,
+            Some(sc)=>{
+                let blk:Vec<u32>=(0..len).map(|p| table.locate(p).0).collect();
+                let blk=Tensor::new(blk.as_slice(), &self.device)?;
+                let codes=self.keys[layer].index_select(&idx, 0)?;
+                let scale=sc[layer].index_select(&blk, 0)?;
+                finish(dequantize_per_channel(&codes, &scale)?)?
+            }
+        };
+        let v=match self.val_scales.as_ref(){
+            None=>finish(self.values[layer].index_select(&idx, 0)?)?,
+            Some(sc)=>{
+                let codes=self.values[layer].index_select(&idx, 0)?;
+                let scale=sc[layer].index_select(&idx, 0)?;
+                finish(dequantize_token(&codes, &scale)?)?
+            }
+        };
+        Ok((k, v))
     }
 
     pub fn num_blocks(&self)->usize{
@@ -125,6 +157,18 @@ impl KVStore for PagedStore<'_>{
         self.pool.gather(layer, self.table, len)
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
 
 // ===========================================================================
 // WRITTEN BY CLAUDE — Day 3 Block 2, KVPool round-trip tests.
@@ -337,16 +381,172 @@ mod tests {
 
         assert_eq!(flat(&p.gather(0, &table, len).unwrap().0), flat(&new));
     }
+
+    // ---- int8 KV ----------------------------------------------------------
+    //
+    // TESTS WRITTEN BY CLAUDE — Day 4 Block 1.
+    //
+    // The Int8 path quantizes after a transpose and dequantizes before one. If
+    // either lands on the wrong side, the scale groups along kv_heads instead of
+    // head_dim: no error, no panic, just quietly worse numbers. These pin it by
+    // asserting the error bound the quantizer promises — scale/2 per element,
+    // where scale comes from the largest magnitude in that token's group.
+
+    fn pool_int8() -> KVPool {
+        KVPool::new(&cfg(), 12, BS, KVDType::Int8, &Device::Cpu).unwrap()
+    }
+
+    /// K and V now use DIFFERENT grouping, so they have different error bounds:
+    ///
+    ///   K: per-channel — scale spans the tokens of a BLOCK, one per channel
+    ///   V: per-token   — scale spans head_dim, one per (token, head)
+    ///
+    /// Asserting each against its own bound is what pins the grouping axis. If
+    /// K were still grouped per-token these bounds would be violated, and if it
+    /// were grouped per-block-per-token they would be too loose to catch it.
+    #[test]
+    fn int8_round_trip_respects_each_schemes_bound() {
+        let p = pool_int8();
+        let blocks = [5u32, 2, 9];
+        let table = table_with(&blocks);
+        let len = blocks.len() * BS;
+
+        let k = kv_for(0, len);
+        p.write(0, &table, 0, &k, &k).unwrap();
+        let (gk, gv) = p.gather(0, &table, len).unwrap();
+
+        let want = flat(&k);
+        let got_k = flat(&gk);
+        let got_v = flat(&gv);
+
+        for h in 0..KV_HEADS {
+            for pos in 0..len {
+                let block = pos / BS;
+                for d in 0..HEAD_DIM {
+                    let i = (h * len + pos) * HEAD_DIM + d;
+
+                    // K: max over the tokens of this block, for this channel.
+                    let k_max = (block * BS..(block + 1) * BS)
+                        .map(|t| val(t, h, d).abs())
+                        .fold(0f32, f32::max);
+                    let k_half = k_max / 127.0 / 2.0 + 1e-4;
+                    assert!(
+                        (got_k[i] - want[i]).abs() <= k_half,
+                        "K[{h}][{pos}][{d}]: {} -> {}, exceeds per-channel half-step {k_half}",
+                        want[i], got_k[i]
+                    );
+
+                    // V: max over head_dim, for this token.
+                    let v_max = (0..HEAD_DIM).map(|c| val(pos, h, c).abs()).fold(0f32, f32::max);
+                    let v_half = v_max / 127.0 / 2.0 + 1e-4;
+                    assert!(
+                        (got_v[i] - want[i]).abs() <= v_half,
+                        "V[{h}][{pos}][{d}]: {} -> {}, exceeds per-token half-step {v_half}",
+                        want[i], got_v[i]
+                    );
+                }
+            }
+        }
+    }
+
+    /// Grouping check with teeth. Head 0 carries small values, head 1 carries
+    /// values 100x larger. Per-token grouping gives each its own scale, so the
+    /// small head must NOT be poisoned by the loud one. If the transpose order
+    /// were wrong the scale would span heads and this fails.
+    #[test]
+    fn int8_scales_do_not_leak_across_heads() {
+        let p = pool_int8();
+        let table = table_with(&[1]);
+        let len = 2;
+
+        let mut data = Vec::new();
+        for h in 0..KV_HEADS {
+            for pos in 0..len {
+                for d in 0..HEAD_DIM {
+                    let base = if h == 0 { 1.0 } else { 500.0 };
+                    data.push(base + (pos * HEAD_DIM + d) as f32 * 0.25);
+                }
+            }
+        }
+        let k = Tensor::from_vec(data.clone(), (1, KV_HEADS, len, HEAD_DIM), &Device::Cpu).unwrap();
+        p.write(0, &table, 0, &k, &k).unwrap();
+        let (gk, _) = p.gather(0, &table, len).unwrap();
+        let got = flat(&gk);
+
+        // Head 0's values are ~1.0; sharing head 1's scale would wreck them.
+        let quiet_err = (0..len * HEAD_DIM)
+            .map(|i| (got[i] - data[i]).abs())
+            .fold(0f32, f32::max);
+        println!("  quiet-head max error: {quiet_err:.6}");
+        assert!(
+            quiet_err < 0.05,
+            "quiet head was poisoned by the loud head: err {quiet_err}"
+        );
+    }
+
+    /// int8 must survive the scattered-block layout, and the partly-filled
+    /// trailing block must still be excluded from the gather.
+    ///
+    /// The bound here is K's: per-channel over a block, so a small value sharing
+    /// a channel with a large one legitimately carries large absolute error.
+    #[test]
+    fn int8_handles_scattered_blocks_and_partial_tails() {
+        let p = pool_int8();
+        let table = table_with(&[7, 1]);
+        let len = 6;
+
+        let k = kv_for(0, len);
+        p.write(0, &table, 0, &k, &k).unwrap();
+        let (gk, _) = p.gather(0, &table, len).unwrap();
+
+        assert_eq!(gk.dims(), &[1, KV_HEADS, len, HEAD_DIM]);
+        let want = flat(&k);
+        let got = flat(&gk);
+        for h in 0..KV_HEADS {
+            for pos in 0..len {
+                let block = pos / BS;
+                for d in 0..HEAD_DIM {
+                    let i = (h * len + pos) * HEAD_DIM + d;
+                    // Only tokens actually written participate in the scale;
+                    // unwritten slots are zero and cannot raise the max.
+                    let hi = ((block + 1) * BS).min(len);
+                    let m = (block * BS..hi).map(|t| val(t, h, d).abs()).fold(0f32, f32::max);
+                    let half = m / 127.0 / 2.0 + 1e-4;
+                    assert!(
+                        (got[i] - want[i]).abs() <= half,
+                        "[{h}][{pos}][{d}]: {} -> {}", want[i], got[i]
+                    );
+                }
+            }
+        }
+    }
+
+    /// F32 and Int8 pools must agree on layout: same shapes, same ordering,
+    /// differing only by quantization error.
+    #[test]
+    fn int8_matches_f32_layout() {
+        let f = pool();
+        let q = pool_int8();
+        let table = table_with(&[3, 8]);
+        let len = 5;
+
+        let k = kv_for(0, len);
+        f.write(0, &table, 0, &k, &k).unwrap();
+        q.write(0, &table, 0, &k, &k).unwrap();
+
+        let (fk, _) = f.gather(0, &table, len).unwrap();
+        let (qk, _) = q.gather(0, &table, len).unwrap();
+        assert_eq!(fk.dims(), qk.dims());
+
+        let a = flat(&fk);
+        let b = flat(&qk);
+        let worst = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        println!("  f32 vs int8 max abs diff: {worst:.6}");
+        assert!(worst > 0.0, "int8 should differ from f32 — is it silently f32?");
+        assert!(worst < 3.0, "int8 diverged too far from f32: {worst}");
+    }
 }
 
-/// Many sequences, one pool, one forward pass.
-///
-/// `PagedStore` binds ONE block table for a single-sequence forward. This binds
-/// B of them, so a decode step reads the weights once for the whole batch
-/// instead of once per sequence — the whole point of continuous batching.
-///
-/// Sequences have different lengths, so `gather_batch` pads to the longest and
-/// `lens` tells the caller where each really ends.
 pub struct BatchedPagedStore<'a>{
     pool:&'a KVPool,
     tables:Vec<&'a BlockTable>,
