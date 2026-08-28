@@ -3,11 +3,11 @@ use crate::block::{BlockAllocator, BlockTable};
 use crate::sampling::{Params, Sampler};
 use crate::stop::{StopReason, Stopper};
 use tokio::sync::mpsc;
+use crate::quant_kv::KVDType;
 use crate::paged_attn::{BatchedPagedStore, KVPool, PagedStore};
 use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor};
 use qwen::model::Qwen2;
-
 
 pub struct Request {
     pub prompt: String,
@@ -26,7 +26,6 @@ pub struct Job {
     pub req: Request,
     pub tx: tokio::sync::mpsc::UnboundedSender<Event>,
 }
-
 
 enum State{
     Waiting, 
@@ -113,12 +112,6 @@ impl Sequence{
         }
     }
 
-    /// Recompute preemption: drop the KV, keep everything else.
-    ///
-    /// `tokens` and `emitted` are deliberately untouched. Text already sent to
-    /// the client cannot be unsent, so rewinding them makes the sequence
-    /// regenerate and re-emit its own prefix. Re-prefill runs over the full
-    /// prompt-plus-generated sequence instead.
     fn preempt(&mut self, alloc:&mut BlockAllocator){
         self.release(alloc);
         self.state=State::Waiting;
@@ -126,7 +119,6 @@ impl Sequence{
     }
 
 }
-
 
 pub struct Scheduler{
     waiting:VecDeque<Sequence>,
@@ -220,13 +212,7 @@ impl Scheduler{
         Ok(())
     }
 
-    /// One decode step for EVERY running sequence, in a single forward pass.
-    ///
-    /// Day 3's first version looped and called forward_decode per sequence,
-    /// which re-read all 3.5GB of weights once per sequence per iteration and
-    /// gave zero throughput scaling. Batching reads them once.
     fn decode(&mut self, model:&qwen::model::Qwen2, tok:&tokenizers::Tokenizer, device:&Device)->Result<()>{
-        // ---- phase 1: sample, emit, and decide who continues ---------------
         let mut active:Vec<usize>=Vec::new();   // indices into self.running
         let mut next_tokens:Vec<u32>=Vec::new();
         let mut preempt_ids:Vec<u64>=Vec::new();
@@ -255,7 +241,6 @@ impl Scheduler{
             return Ok(());
         }
 
-        // ---- phase 2: grow block tables BEFORE any KV is written ----------
         let mut batch:Vec<usize>=Vec::new();
         let mut batch_tokens:Vec<u32>=Vec::new();
         for (k, &i) in active.iter().enumerate(){
@@ -264,7 +249,6 @@ impl Scheduler{
                 batch.push(i);
                 batch_tokens.push(next_tokens[k]);
             }else{
-                // Pool exhausted: this one sits out and re-prefills later.
                 preempt_ids.push(self.running[i].id);
             }
         }
@@ -273,7 +257,6 @@ impl Scheduler{
             return Ok(());
         }
 
-        // ---- phase 3: ONE forward for the whole batch ---------------------
         let tables:Vec<&BlockTable>=batch.iter().map(|&i| &self.running[i].table).collect();
         let write_pos:Vec<usize>=batch.iter().map(|&i| self.running[i].pos).collect();
         let store=BatchedPagedStore::new(&self.pool, tables, write_pos);
@@ -321,14 +304,6 @@ impl Scheduler{
         }
     }
 }
-
-
-
-
-
-
-
-
 
 // ===========================================================================
 // TESTS WRITTEN BY CLAUDE — Day 3 Block 3, Sequence state machine.
@@ -383,7 +358,7 @@ mod tests {
     }
 
     fn scheduler(num_blocks: usize) -> Scheduler {
-        let pool = KVPool::new(&cfg(), num_blocks, BS, DType::F32, &Device::Cpu).unwrap();
+        let pool = KVPool::new(&cfg(), num_blocks, BS, KVDType::F32, &Device::Cpu).unwrap();
         Scheduler::new(pool, BS)
     }
 

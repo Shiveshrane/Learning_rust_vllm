@@ -11,13 +11,10 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 use std::convert::Infallible;
 
-
 #[derive(Clone)]
 struct AppState {
     jobs: mpsc::UnboundedSender<Job>,
 }
-
-
 
 async fn health()->&'static str{
     "OK"
@@ -57,8 +54,6 @@ async fn collect_response(mut rx: mpsc::UnboundedReceiver<Event>)->Result<Json<C
     Err((StatusCode::INTERNAL_SERVER_ERROR, "worker closed".into()))
 }
 
-
-
 async fn completions(State(st):State<AppState>,Json(req):Json<CompletionRequest>)->Response{
     let (tx, mut rx) = mpsc::unbounded_channel();
     let stream=req.stream;
@@ -82,8 +77,6 @@ async fn completions(State(st):State<AppState>,Json(req):Json<CompletionRequest>
     // }
     // Err((StatusCode::INTERNAL_SERVER_ERROR, "worker closed".into()))
 
-    // The layering boundary: serde/axum types stay in `server`, the engine
-    // receives plain data. This is the only place the two vocabularies meet.
     let job = Job {
         req: Request {
             prompt: req.prompt,
@@ -109,7 +102,6 @@ async fn completions(State(st):State<AppState>,Json(req):Json<CompletionRequest>
         collect_response(rx).await.into_response()
     }
 }
-
 
 #[tokio::main]
 async fn main() ->anyhow::Result<()>{

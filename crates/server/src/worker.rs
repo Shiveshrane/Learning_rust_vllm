@@ -1,6 +1,7 @@
 use anyhow::Result;
 use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
+use engine::quant_kv::KVDType;
 use engine::paged_attn::KVPool;
 use engine::scheduler::{Job, Scheduler};
 use qwen::config::QwenConfig;
@@ -61,14 +62,12 @@ fn load()->Result<WorkerState>{
     //let cache=KVCache::new(&cfg, 4096, DType::F32, &device)?;
 
     const BLOCK_SIZE:usize=16;
-    // Overridable so the preemption path can be exercised with a tiny pool:
-    //   KV_BUDGET_BYTES=40000000 cargo run -p server --release
     let budget:usize=std::env::var("KV_BUDGET_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2_000_000_000);
     let num_blocks=engine::block::blocks_for_budget(budget, &cfg, BLOCK_SIZE, 4);
-    let pool=KVPool::new(&cfg, num_blocks, BLOCK_SIZE, DType::F32, &device)?;
+    let pool=KVPool::new(&cfg, num_blocks, BLOCK_SIZE, KVDType::F32, &device)?;
     println!(
         "KV pool: {num_blocks} blocks x {BLOCK_SIZE} tokens = {} tokens ({:.1} GB)",
         num_blocks * BLOCK_SIZE,

@@ -16,6 +16,7 @@
 use anyhow::Result;
 use candle_core::DType;
 use candle_nn::VarBuilder;
+use engine::quant_kv::KVDType;
 use engine::paged_attn::KVPool;
 use engine::sampling::Params;
 use engine::scheduler::{Event, Job, Request, Scheduler};
@@ -50,7 +51,7 @@ fn load() -> Result<Harness> {
 /// Run `n` identical greedy requests through a pool of `num_blocks`, stepping
 /// until every stream reports Done. Returns the text each stream received.
 fn run(h: &Harness, num_blocks: usize, n: usize, max_tokens: usize) -> Result<(Vec<String>, usize)> {
-    let pool = KVPool::new(&h.cfg, num_blocks, BLOCK_SIZE, DType::F32, &h.device)?;
+    let pool = KVPool::new(&h.cfg, num_blocks, BLOCK_SIZE, KVDType::F32, &h.device)?;
     let mut sched = Scheduler::new(pool, BLOCK_SIZE);
     let vocab = h.tok.get_vocab_size(true);
     let eos = h.cfg.eos_token_id;

@@ -3,29 +3,49 @@ use crate::block::BlockTable;
 use candle_core::{DType, Device, Tensor};
 use anyhow::Result;
 use qwen::cache::KVStore;
+use crate::quant_kv::{dequantize_token, quantize_token, KVDType};
 pub struct KVPool{
     keys: Vec<Tensor>,
     values: Vec<Tensor>,
+    key_scales:Option<Vec<Tensor>>,
+    val_scales:Option<Vec<Tensor>>,
+    key_dtype:KVDType,
     block_size: usize,
     num_blocks: usize,
     device: Device,
 }
 
-
 impl KVPool{
-    pub fn new(cfg:&QwenConfig, num_blocks:usize, block_size:usize, dtype: DType, device: &Device)->Result<Self>{
+    pub fn new(cfg:&QwenConfig, num_blocks:usize, block_size:usize, dtype: KVDType, device: &Device)->Result<Self>{
         let mut keys=Vec::with_capacity(cfg.num_hidden_layers);
         let mut values=Vec::with_capacity(cfg.num_hidden_layers);
         let slots=num_blocks*block_size;
         let kv_heads=cfg.num_key_value_heads;
         let head_dim=cfg.head_dim();
+
+        let store=match dtype{
+            KVDType::F32=>DType::F32,
+            KVDType::Int8=>DType::U8,
+        };
+        let mut key_scales=Vec::new();
+        let mut val_scales=Vec::new();
         for _ in 0..cfg.num_hidden_layers{
-            let k=Tensor::zeros(&[slots, kv_heads, head_dim], dtype, device)?;
-            let v=Tensor::zeros(&[slots, kv_heads, head_dim], dtype, device)?;
+            let k=Tensor::zeros(&[slots, kv_heads, head_dim], store, device)?;
+            let v=Tensor::zeros(&[slots, kv_heads, head_dim], store, device)?;
             keys.push(k);
             values.push(v);
+            if dtype==KVDType::Int8{
+                let k_scale=Tensor::zeros(&[slots, kv_heads, 1], DType::F32, device)?;
+                let v_scale=Tensor::zeros(&[slots, kv_heads, 1], DType::F32, device)?;
+                key_scales.push(k_scale);
+                val_scales.push(v_scale);
+            }
         }
-        Ok(Self { keys, values, block_size, num_blocks, device: device.clone() })
+        let (key_scales, val_scales)= match dtype{
+            KVDType::F32=>(None, None),
+            KVDType::Int8=>(Some(key_scales), Some(val_scales)),
+        };
+        Ok(Self { keys, values, key_scales, val_scales, key_dtype: dtype, block_size, num_blocks, device: device.clone() })
     }
     fn slot_of(&self, table:&BlockTable, pos:usize)->usize{
         let (block, slot)=table.locate(pos);
@@ -34,12 +54,30 @@ impl KVPool{
 
     pub fn write(&self, layer:usize, table:&BlockTable, start_pos:usize, k:&Tensor, v:&Tensor)->Result<()>{
         let s=k.dim(2)?;
-        let k3=k.squeeze(0)?.transpose(0,1)?.contiguous()?;
+        let k3=k.squeeze(0)?.transpose(0,1)?.contiguous()?;   // [s, kv_heads, head_dim]
         let v3=v.squeeze(0)?.transpose(0,1)?.contiguous()?;
-        for i in 0..s{
-            let dst=self.slot_of(table, start_pos+i);
-            self.keys[layer].slice_set(&k3.narrow(0,i,1)?.contiguous()?,0, dst)?;
-            self.values[layer].slice_set(&v3.narrow(0,i,1)?.contiguous()?,0, dst)?;
+
+        match self.key_dtype{
+            KVDType::F32=>{
+                for i in 0..s{
+                    let dst=self.slot_of(table, start_pos+i);
+                    self.keys[layer].slice_set(&k3.narrow(0,i,1)?.contiguous()?,0, dst)?;
+                    self.values[layer].slice_set(&v3.narrow(0,i,1)?.contiguous()?,0, dst)?;
+                }
+            }
+            KVDType::Int8=>{
+                let (kq, ks)=quantize_token(&k3)?;   // codes [s,kvh,hd], scales [s,kvh,1]
+                let (vq, vs)=quantize_token(&v3)?;
+                let key_scales=self.key_scales.as_ref().expect("Int8 pool has key scales");
+                let val_scales=self.val_scales.as_ref().expect("Int8 pool has value scales");
+                for i in 0..s{
+                    let dst=self.slot_of(table, start_pos+i);
+                    self.keys[layer].slice_set(&kq.narrow(0,i,1)?.contiguous()?,0, dst)?;
+                    self.values[layer].slice_set(&vq.narrow(0,i,1)?.contiguous()?,0, dst)?;
+                    key_scales[layer].slice_set(&ks.narrow(0,i,1)?.contiguous()?,0, dst)?;
+                    val_scales[layer].slice_set(&vs.narrow(0,i,1)?.contiguous()?,0, dst)?;
+                }
+            }
         }
         Ok(())
     }
@@ -47,15 +85,20 @@ impl KVPool{
         let idx:Vec<u32>=(0..len).map(|i| self.slot_of(table, i) as u32).collect();
         let idx=Tensor::new(idx.as_slice(), &self.device)?;
 
-        let pick=|pool:&Tensor|->Result<Tensor>{
-            Ok(pool
-            .index_select(&idx, 0)?
-            .transpose(0,1)?
-            .contiguous()?
-            .unsqueeze(0)?)
+        let pick=|pool:&Tensor, scales:Option<&Tensor>|->Result<Tensor>{
+            let picked=pool.index_select(&idx, 0)?;
+            let x=match scales{
+                None=>picked,
+                Some(sc)=>dequantize_token(&picked, &sc.index_select(&idx, 0)?)?,
+            };
+            Ok(x.transpose(0,1)?.contiguous()?.unsqueeze(0)?)
         };
-        Ok((pick(&self.keys[layer])?, pick(&self.values[layer])?))
+
+        let ks=self.key_scales.as_ref().map(|v| &v[layer]);
+        let vs=self.val_scales.as_ref().map(|v| &v[layer]);
+        Ok((pick(&self.keys[layer], ks)?, pick(&self.values[layer], vs)?))
     }
+
     pub fn num_blocks(&self)->usize{
         self.num_blocks
     }
@@ -82,11 +125,6 @@ impl KVStore for PagedStore<'_>{
         self.pool.gather(layer, self.table, len)
     }
 }
-
-
-
-
-
 
 // ===========================================================================
 // WRITTEN BY CLAUDE — Day 3 Block 2, KVPool round-trip tests.
@@ -160,7 +198,7 @@ mod tests {
     }
 
     fn pool() -> KVPool {
-        KVPool::new(&cfg(), 12, BS, DType::F32, &Device::Cpu).unwrap()
+        KVPool::new(&cfg(), 12, BS, KVDType::F32, &Device::Cpu).unwrap()
     }
 
     /// The core claim: whatever physical blocks a sequence owns, gather returns

@@ -5,7 +5,6 @@ use candle_nn::ops::sdpa;
 use crate::cache::{BatchedKvStore, KVCache, KVStore};
 use crate::config::QwenConfig;
 
-
 pub struct RMSNorm{
     pub eps: f64,
     pub weight: Tensor,
@@ -27,7 +26,6 @@ impl RMSNorm{
         Ok(normed.broadcast_mul(&self.weight)? )
     }
 }
-
 
 pub struct Mlp {
     gate_proj: Linear, 
@@ -52,7 +50,6 @@ impl Mlp {
     }
 }
 
-
 pub struct RoPE{
     pub cos: Tensor,
     pub sin: Tensor,
@@ -75,7 +72,6 @@ impl RoPE{
             sin: freqs.sin()?,
         })
     }
-
 
     pub fn apply_at(&self, x:&Tensor, pos:&Tensor)-> Result<Tensor>{
         let (b, _h, s, d)=x.dims4()?;
@@ -103,9 +99,6 @@ impl RoPE{
         Ok(Tensor::cat(&[r1, r2], D::Minus1)?.to_dtype(x.dtype())?)
     }
 }
-
-
-
 
 pub struct Attention{
     pub q_proj: Linear,
@@ -175,14 +168,6 @@ impl Attention{
         store.write_batch(layer, &k, &v)?;
         let (k, v)=store.gather_batch(layer)?;
 
-        // NOT sdpa. On Metal, q_seq == 1 takes the vectorized kernel
-        // (`supports_sdpa_vector`), and `call_sdpa_vector` accepts no mask
-        // argument — masks are silently ignored there. Batched decode pads
-        // shorter sequences, and padding must be masked: a zero key is not
-        // neutral, exp(q.0) = 1 gives it real attention weight.
-        //
-        // So attention is hand-rolled here. The batching win is in the
-        // projections and the MLP, which is where the 3.5GB of weights live.
         let k=repeat_kv(&k, self.kv_groups)?;
         let v=repeat_kv(&v, self.kv_groups)?;
         let scores=q.matmul(&k.transpose(2,3)?.contiguous()?)?;
@@ -242,7 +227,6 @@ impl Attention{
     }
 }
 
-
 pub struct DecoderLayer{
     input_layernorm: RMSNorm, 
     self_attention: Attention,
@@ -294,11 +278,8 @@ impl DecoderLayer{
         Ok((x+residual)?)
     }
 
-
 }
 
-/// Expand KV heads to match query heads for the hand-rolled matmul.
-/// `sdpa` does this internally; the manual path needs it materialised.
 fn repeat_kv(x:&Tensor, groups:usize)->Result<Tensor>{
     if groups==1{
         return Ok(x.clone());
@@ -319,9 +300,6 @@ fn causal_mask(s:usize, offset:usize, dtype: DType, device:&Device)->Result<Tens
     Ok(Tensor::from_vec(data, (s, kv_len), device)?.to_dtype(dtype)?)
 }
 
-
-
-
 pub struct Qwen2{
     embedding: Embedding,
     layers: Vec<DecoderLayer>,
@@ -331,7 +309,6 @@ pub struct Qwen2{
     device: Device,
     dtype: DType,
 }
-
 
 impl Qwen2{
     pub fn load(cfg: &QwenConfig, max_seq:usize, vb:VarBuilder)->Result<Self>{
@@ -387,7 +364,6 @@ impl Qwen2{
     //     Ok(self.lm_head.forward(&h)?)
     // }
 
-
     pub fn forward_prefill(
         &self, 
         input_ids:&Tensor, 
@@ -413,12 +389,6 @@ impl Qwen2{
         Ok(self.lm_head.forward(&h)?)
     }
 
-
-    /// One decode step for a whole batch: B sequences advance together, reading
-    /// the weights ONCE instead of once each. That is the bandwidth win that
-    /// makes an inference server worth writing rather than a generate() loop.
-    ///
-    /// `input_ids`: [B, 1] — the token each sequence just sampled.
     pub fn forward_decode_batch(
         &self,
         input_ids:&Tensor,
@@ -429,15 +399,12 @@ impl Qwen2{
         let max_len=lens.iter().copied().max().unwrap_or(0);
         let num_heads=self.layers[0].self_attention.num_heads;
 
-        // Sequences have different histories, so the gather is padded. Mask it:
-        // element i may attend to 0..lens[i] and nothing beyond.
         let mut m=Vec::with_capacity(b*max_len);
         for &l in lens{
             for j in 0..max_len{
                 m.push(if j<l {0f32} else {f32::NEG_INFINITY});
             }
         }
-        // Stride-0 expand over the head axis: sdpa checks dims, honours strides.
         let mask=Tensor::from_vec(m, (b, 1, 1, max_len), &self.device)?
             .to_dtype(self.dtype)?
             .expand((b, num_heads, 1, max_len))?

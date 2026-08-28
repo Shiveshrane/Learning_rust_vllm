@@ -8,7 +8,6 @@ use qwen::paths::ModelPaths;
 use qwen::cache::{KVCache, KVStore};
 //use engine::sampling::{Params, Sampler};
 
-
 const PROMPT:&str="The capital of France is";
 
 fn greedy_decode(model: &Qwen2, tok:&tokenizers::Tokenizer, input:&[u32], device:&Device, eos:u32, max_new_tokens:usize, cache: &mut KVCache)->Result<String>{

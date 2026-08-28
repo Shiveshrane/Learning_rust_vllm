@@ -9,9 +9,7 @@ use qwen::cache::KVCache;
 use engine::sampling::{Params, Sampler};
 use engine::stop::{Stopper, StopReason};
 
-
 const PROMPT:&str="Which city is the capital of France?";
-
 
 fn greedy_decode(model: &Qwen2, tok:&tokenizers::Tokenizer, input:&[u32], device:&Device, max_new_tokens:usize, cache: &mut KVCache, sampler: &mut Sampler, stopper: &mut Stopper)->Result<String>{
     let mut ip_ids=input.to_vec();
@@ -20,8 +18,6 @@ fn greedy_decode(model: &Qwen2, tok:&tokenizers::Tokenizer, input:&[u32], device
     // let logits=model.forward_prefill(&input, cache)?;
     let logits=model.forward_prefill(&input, cache, 0)?;
     let mut last_tok=logits.i((0, ip_ids.len()-1))?.to_dtype(DType::F32)?;
-    // Position is the caller's job now: the cache no longer tracks it.
-    // The prompt occupies 0..T, so the first generated token sits at T.
     let mut pos=ip_ids.len();
     // for i in 0..max_new_tokens{
     //     //let top=last_tok.argmax(D::Minus1)?.to_scalar::<u32>()?;

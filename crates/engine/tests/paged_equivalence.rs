@@ -20,6 +20,7 @@ use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor, D};
 use candle_nn::VarBuilder;
 use engine::block::{BlockAllocator, BlockTable};
+use engine::quant_kv::KVDType;
 use engine::paged_attn::{KVPool, PagedStore};
 use qwen::cache::{KVCache, KVStore};
 use qwen::config::QwenConfig;
@@ -87,7 +88,7 @@ fn paged_kv_matches_contiguous_kv() -> Result<()> {
     let cache = KVCache::new(&cfg, 4096, DType::F32, &device)?;
 
     // --- backend B: the paged pool ------------------------------------------
-    let pool = KVPool::new(&cfg, NUM_BLOCKS, BLOCK_SIZE, DType::F32, &device)?;
+    let pool = KVPool::new(&cfg, NUM_BLOCKS, BLOCK_SIZE, KVDType::F32, &device)?;
     let mut alloc = BlockAllocator::new(NUM_BLOCKS);
     let mut decoys: Vec<u32> = Vec::new();
     let mut table = BlockTable::new(BLOCK_SIZE);
