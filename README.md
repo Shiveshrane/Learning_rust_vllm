@@ -194,3 +194,92 @@ Deliberate over-subscription forces preemption (95 scheduler steps versus 61 wit
 a roomy pool) and the output is byte-identical, so recompute is invisible to the
 client. The block invariant — `free + held == total`, two independently
 maintained numbers — is asserted every scheduler iteration.
+
+## Day 4 measurements — int8 KV
+
+Symmetric int8, stored as `u8` with a `+128` offset because candle has no `I8`.
+Per-channel scales for K, per-token for V, following KIVI. Runtime-selectable:
+
+```sh
+KV_DTYPE=int8 cargo run --release -p server
+```
+
+### The scorecard
+
+| | F32 | int8 | delta |
+|---|---|---|---|
+| Tokens resident in a 2 GB pool | 34,864 | **135,280** | **3.88x** |
+| Perplexity (512-token held-out passage) | 50.9099 | 51.3057 | **+0.78%** |
+| Aggregate tok/s at concurrency 32 | 187.9 | 135.2 | **-28%** |
+
+Bytes per token: `57,344` (F32) against `14,784` (int8 = 14,336 codes + 448
+scales; scales are 3% overhead).
+
+### Grouping is the whole question
+
+Error is roughly `scale/2` per element, and the scale is set by the largest
+magnitude in the group — so one outlier makes every other value in that group
+noise. Measured on a synthetic group, values sharing a scale with a 400x outlier
+came back **73x** worse than the same values in a clean group.
+
+Key and value tensors need different grouping. Keys carry persistent
+per-channel outliers, and K errors are amplified because they pass through
+`q.k^T` and then softmax; V errors pass through a linear weighted sum. Measured
+on real keys at layer granularity, K's absolute reconstruction error is **32x**
+V's, at identical relative error — K values are simply larger.
+
+Switching K from per-token to per-channel, on the real checkpoint:
+
+| K grouping | logit max\|diff\| | relative to peak logit | next-token argmax |
+|---|---|---|---|
+| per-token (naive) | 2.3487 | 16.19% | `" "` — wrong |
+| per-channel (KIVI) | 0.8268 | 5.70% | `" Paris"` — correct |
+
+Perplexity says the remaining 5.70% logit error costs **0.78%** of predictive
+quality. Greedy decoding still diverges from the F32 trajectory after ~10
+tokens, because argmax amplifies small logit differences at genuinely uncertain
+choices — the text differs, the model is not meaningfully worse.
+
+### The throughput result, which contradicts the premise
+
+The usual argument is that halving KV bytes buys throughput directly, because
+decode is memory-bandwidth-bound. Measured here it does the opposite, and the
+gap widens with concurrency:
+
+| concurrency | F32 tok/s | int8 tok/s |
+|---|---|---|
+| 1 | 37.9 | 35.2 |
+| 4 | 76.8 | 66.4 |
+| 8 | 120.5 | 96.8 |
+| 16 | 153.4 | 115.8 |
+| 32 | 187.9 | 135.2 |
+
+Bytes saved on the pool read are paid for twice in compute:
+
+1. **`gather` dequantizes on every read** — `to_dtype`, `affine`,
+   `broadcast_mul`, plus a second `index_select` for K's block-indexed scales.
+   Three extra full-size tensor ops per layer per step.
+2. **`write` requantizes a whole 16-slot block per token.** Per-channel K scales
+   span a block, so a decode write dequantizes 16 slots, overwrites one row,
+   recomputes the scale, and writes all 16 back — ~16x the quantize work, on
+   every token, on every one of 28 layers.
+
+Cost (2) scales with batch size, which is why the penalty grows from 7% to 28%.
+The premise holds only when dequantization is **fused into the attention
+kernel**; with dequant-on-gather it is the same trade as Day 3's `index_select`
+— the capacity win is kept in full and the bandwidth win is lost rather than
+merely forgone.
+
+So int8 here buys **4x the concurrent sequences for 0.8% quality and a 28%
+throughput penalty**. Worth it if capacity-bound, not if throughput-bound.
+
+### Partial blocks
+
+A per-channel K scale spans all 16 tokens of a block, so it is not final until
+the block fills — and decode writes one token at a time. Rather than staging
+partial blocks in F32 (which would need per-sequence state that `KVPool`, being
+shared, does not have), a write requantizes the whole block: dequantize its 16
+slots, overwrite the incoming rows, recompute the scale, write back. Unwritten
+slots are zeros and cannot raise a max, so the scale is correct without tracking
+fill level, and error does not compound — once a value sits on the quantization
+grid, requantizing at an unchanged scale returns it exactly.
