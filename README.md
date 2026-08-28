@@ -11,7 +11,7 @@ Built as a 5-day learning project.
 - [x] **Day 0** — workspace, Metal smoke test, checkpoint verified
 - [x] [**Day 1**](lessons/day1.md) — forward pass, greedy decode, golden-logit gate
 - [x] [**Day 2**](lessons/day2.md) — KV cache, sampling, SSE streaming server
-- [ ] [**Day 3**](lessons/day3.md) — paged KV cache, continuous batching
+- [x] [**Day 3**](lessons/day3.md) — paged KV cache, continuous batching
 - [ ] [**Day 4**](lessons/day4.md) — KV quantization, prefix caching, benchmarks
 - [ ] [**Day 5**](lessons/day5.md) — YaRN, long context, OpenAI compatibility
 
@@ -116,3 +116,81 @@ is `O(context)` per step, and the cache readback copies the whole span with
 Sampling costs ~10 ms/token when enabled (37.3 → 27.4 tok/s), almost entirely the
 608 KB device→host `to_vec1` of the logits row. The fix is on-device top-k so
 only survivors cross the bus; not yet done.
+
+## Day 3 measurements
+
+Paged KV cache (16-token blocks) plus continuous batching. Same machine, F32
+weights on Metal, 40 tokens per request over HTTP/SSE.
+
+### Throughput against concurrency
+
+| concurrency | tok/s | vs 1x | efficiency | TTFT p50 |
+|---|---|---|---|---|
+| 1 | 37.6 | 1.00x | 100% | 51 ms |
+| 2 | 43.4 | 1.15x | 58% | 96 ms |
+| 4 | 73.9 | 1.96x | 49% | 188 ms |
+| 8 | 114.4 | 3.04x | 38% | 370 ms |
+| 16 | 150.4 | 4.00x | 25% | 729 ms |
+| 32 | 181.1 | 4.81x | 15% | 1429 ms |
+
+Batching is worth **4.8x** at concurrency 32, and the curve bends immediately —
+efficiency is already 58% at two concurrent requests. Three costs scale with
+batch size instead of amortising:
+
+1. **The KV gather.** Every decode step copies each sequence's blocks into a
+   contiguous tensor, pads to the longest, and concatenates. That is `O(B x L)`
+   per layer per step. vLLM avoids it entirely by walking the block table inside
+   the attention kernel; candle has no Metal equivalent (see gaps below).
+2. **`repeat_kv` in the batched path.** GQA expansion is materialised 6x because
+   the batched decode cannot use `sdpa` (see gaps).
+3. **Sampling.** `Sampler::sample` copies a 151,936-float logits row to the host
+   per sequence per step — 608 KB each, so 19 MB per step at concurrency 32,
+   plus a CPU pass per sequence. On-device top-k would move only the survivors.
+
+Weight reads *do* amortise, which is where the 4.8x comes from: one pass over
+3.5 GB now serves the whole batch instead of one sequence.
+
+TTFT grows roughly linearly with concurrency because prefill and decode
+alternate: a step is either one or the other, so an arriving request stalls
+every running sequence for one long step. Chunked prefill is the fix and is
+deliberately not implemented (see below).
+
+### Against Day 2
+
+| | Day 2 | Day 3 |
+|---|---|---|
+| KV per sequence | 4096 tokens preallocated | 16-token blocks on demand |
+| Waste on a 50-token generation | 99% | <0.4% |
+| Concurrent sequences in budget | ~63 | thousands |
+| Aggregate tok/s | 40.8 (single stream) | 181.1 |
+
+### Known gaps
+
+**Gather, not a kernel.** `KVPool::gather` uses `index_select` to make scattered
+blocks contiguous before `sdpa`. The memory-management win is intact — no
+fragmentation, no over-reservation, and prefix sharing becomes possible — but
+part of the bandwidth win is given up, because KV is copied every step rather
+than read in place. A hand-written MSL paged-attention kernel is the fix.
+
+**`sdpa` ignores masks during decode.** On Metal, `q_seq == 1` selects the
+vectorised kernel and `call_sdpa_vector` takes no mask argument. Batched decode
+pads ragged sequence lengths and *must* mask the padding — a zero key is not
+neutral, `exp(q.0) = 1` gives it real attention weight — so the batched path
+uses hand-rolled attention instead.
+
+**KV pool capped at 2 GB.** Above roughly 4 GB, candle's Metal backend hands out
+buffers that alias ones still in use: logits stay bit-exact while `argmax`
+returns the contents of the gather index tensor. Not a paging bug — verified
+`max|diff| = 0` against the contiguous cache at every pool size.
+
+**Alternate prefill/decode, not chunked.** Chosen for simplicity; the TTFT cost
+is visible in the table above.
+
+### Correctness
+
+Paged KV is bit-identical to the contiguous cache: `max|diff| = 0.000000` across
+prefill and 20 decode steps, with deliberately non-adjacent block tables.
+Deliberate over-subscription forces preemption (95 scheduler steps versus 61 with
+a roomy pool) and the output is byte-identical, so recompute is invisible to the
+client. The block invariant — `free + held == total`, two independently
+maintained numbers — is asserted every scheduler iteration.
