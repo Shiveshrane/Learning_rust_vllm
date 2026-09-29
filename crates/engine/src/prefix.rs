@@ -1,11 +1,13 @@
-use anyhow::Result;
-use candle_core::{DType, Device};
+
+use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
+use crate::block::BlockAllocator;
 
 
 pub struct PrefixCache{
     by_hash:HashMap<u64, u32>,
     hash_of:HashMap<u32, u64>,
-    refcount:HashMap<u64, usize>,
+    refcount:HashMap<u32, usize>,
     lru:VecDeque<u32>,
     block_size:usize,
 }
@@ -39,6 +41,12 @@ impl PrefixCache{
         }
         out
     }
+    pub fn live_blocks(&self)->usize{
+    self.refcount.values().filter(|c| **c>0).count()
+    }
+    pub fn parked(&self)->usize{
+    self.lru.len()
+    }
 
     pub fn alloc_block(&mut self, alloc:&mut BlockAllocator)->Option<u32>{
         if let Some(id)=alloc.allocate(){
@@ -64,11 +72,11 @@ impl PrefixCache{
         let mut adopted=Vec::new();
         let mut parent=0u64;
         for i in 0..tokens.len()/self.block_size{
-            let chunk=*tokens[i*block_size..(i+1)*self.block_size];
+            let chunk=&tokens[i*self.block_size..(i+1)*self.block_size];
             let h=block_hash(parent, chunk);
-            let some(&block)=self.by_hash.get(&h) else {break};
+            let Some(&block)=self.by_hash.get(&h) else {break};
             *self.refcount.entry(block).or_insert(0)+=1;
-            if let Some(p)=self.lru.iter().position(|b| b==block){
+            if let Some(p)=self.lru.iter().position(|&b| b==block){
                 self.lru.remove(p);
             }
             adopted.push(block);
@@ -85,7 +93,7 @@ impl PrefixCache{
         self.hash_of.insert(block, hash);
     }
 
-    pub fn release(&mut self, block:&[u32], alloc:&mut BlockAllocator){
+    pub fn release(&mut self, blocks:&[u32], alloc:&mut BlockAllocator){
         for &b in blocks{
             let rc=self.refcount.entry(b).or_insert(0);
             if *rc>0{

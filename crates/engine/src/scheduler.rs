@@ -8,6 +8,7 @@ use crate::paged_attn::{BatchedPagedStore, KVPool, PagedStore};
 use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor};
 use qwen::model::Qwen2;
+use crate::prefix::PrefixCache;
 
 pub struct Request {
     pub prompt: String,
@@ -49,6 +50,7 @@ struct Sequence{
     finish:Option<StopReason>,
 }
 
+
 impl Sequence{
     fn new(
         id:u64,
@@ -81,16 +83,15 @@ impl Sequence{
 
     }
 
-    fn ensure_blocks(&mut self, alloc:&mut BlockAllocator, needed:usize)->bool{
+    fn ensure_blocks(&mut self, prefix:&mut PrefixCache, alloc:&mut BlockAllocator, needed:usize)->bool{
         while self.table.capacity()<needed{
-            match alloc.allocate(){
+            match prefix.alloc_block(alloc){
                 Some(id)=>self.table.append_block(id),
                 None=>return false,
             }
         }
         true
     }
-
     fn store<'a>(&'a self, pool:&'a KVPool)->PagedStore<'a>{
         PagedStore::new(pool, &self.table)
     }
@@ -106,14 +107,13 @@ impl Sequence{
         self.emitted=text.len();
         Ok(out)
     }
-    fn release(&mut self, alloc:&mut BlockAllocator){
-        for id in self.table.take_blocks(){
-            alloc.free_block(id);
-        }
+    fn release(&mut self, prefix: &mut PrefixCache, alloc:&mut BlockAllocator){
+        let blocks=self.table.take_blocks();
+        prefix.release(&blocks, alloc);
     }
 
-    fn preempt(&mut self, alloc:&mut BlockAllocator){
-        self.release(alloc);
+    fn preempt(&mut self, prefix: &mut PrefixCache, alloc:&mut BlockAllocator){
+        self.release(prefix, alloc);
         self.state=State::Waiting;
         self.pos=0;
     }
@@ -127,6 +127,7 @@ pub struct Scheduler{
     alloc:BlockAllocator,
     block_size:usize,
     next_id:u64,
+    prefix_cache:PrefixCache,
 }
 
 impl Scheduler{
@@ -138,6 +139,7 @@ impl Scheduler{
             pool,
             alloc,
             block_size,
+            prefix_cache:PrefixCache::new(block_size),
             next_id:0,
         }
     }
@@ -189,7 +191,7 @@ impl Scheduler{
     fn schedule(&mut self)->usize{
         let mut admitted=0;
         while let Some(seq)=self.waiting.front_mut(){
-            if !seq.ensure_blocks(&mut self.alloc, seq.tokens.len()){
+            if !seq.ensure_blocks(&mut self.prefix_cache, &mut self.alloc, seq.tokens.len()){
                 break;
             }
             let seq=self.waiting.pop_front().unwrap();
@@ -245,7 +247,7 @@ impl Scheduler{
         let mut batch_tokens:Vec<u32>=Vec::new();
         for (k, &i) in active.iter().enumerate(){
             let need=self.running[i].pos+1;
-            if self.running[i].ensure_blocks(&mut self.alloc, need){
+            if self.running[i].ensure_blocks(&mut self.prefix_cache, &mut self.alloc, need){
                 batch.push(i);
                 batch_tokens.push(next_tokens[k]);
             }else{
@@ -279,7 +281,7 @@ impl Scheduler{
         for id in ids{
             if let Some(i)=self.running.iter().position(|s| s.id==*id){
                 let mut seq=self.running.remove(i);
-                seq.preempt(&mut self.alloc);
+                seq.preempt(&mut self.prefix_cache, &mut self.alloc);
                 seq.last=None;
                 self.waiting.push_front(seq);
             }
@@ -297,7 +299,7 @@ impl Scheduler{
                     prompt_tokens:seq.prompt_len,
                     completion_tokens:seq.stopper.generated(),
                 });
-                seq.release(&mut self.alloc);
+                seq.release(&mut self.prefix_cache, &mut self.alloc);
             }else{
                 i+=1;
             }
@@ -427,16 +429,16 @@ mod tests {
         let mut seq = s.waiting.pop_front().unwrap();
 
         // 5 prompt tokens at block_size 4 -> 2 blocks.
-        assert!(seq.ensure_blocks(&mut s.alloc, 5));
+        assert!(seq.ensure_blocks(&mut s.prefix_cache, &mut s.alloc, 5));
         assert_eq!(seq.table.len_blocks(), 2);
         assert_eq!(s.alloc.free_count(), 6);
 
         // Still inside capacity 8: no new block.
-        assert!(seq.ensure_blocks(&mut s.alloc, 8));
+        assert!(seq.ensure_blocks(&mut s.prefix_cache, &mut s.alloc, 8));
         assert_eq!(seq.table.len_blocks(), 2, "capacity 8 already covers 8 tokens");
 
         // Crossing into the ninth token needs a third block.
-        assert!(seq.ensure_blocks(&mut s.alloc, 9));
+        assert!(seq.ensure_blocks(&mut s.prefix_cache, &mut s.alloc, 9));
         assert_eq!(seq.table.len_blocks(), 3);
         assert_eq!(s.alloc.free_count(), 5);
     }
@@ -451,9 +453,9 @@ mod tests {
         s.admit(j, &tok, tok.get_vocab_size(true), EOS).unwrap();
         let mut seq = s.waiting.pop_front().unwrap();
 
-        assert!(seq.ensure_blocks(&mut s.alloc, 8), "8 tokens fit in 2 blocks");
+        assert!(seq.ensure_blocks(&mut s.prefix_cache, &mut s.alloc, 8), "8 tokens fit in 2 blocks");
         assert_eq!(s.alloc.free_count(), 0);
-        assert!(!seq.ensure_blocks(&mut s.alloc, 9), "pool is empty");
+        assert!(!seq.ensure_blocks(&mut s.prefix_cache, &mut s.alloc, 9), "pool is empty");
         assert_eq!(seq.table.len_blocks(), 2, "failed growth must not half-allocate");
     }
 
@@ -467,13 +469,13 @@ mod tests {
         s.admit(j, &tok, tok.get_vocab_size(true), EOS).unwrap();
         let mut seq = s.waiting.pop_front().unwrap();
 
-        seq.ensure_blocks(&mut s.alloc, 20);
+        seq.ensure_blocks(&mut s.prefix_cache, &mut s.alloc, 20);
         assert_eq!(s.alloc.free_count(), 3);
 
-        seq.release(&mut s.alloc);
+        seq.release(&mut s.prefix_cache, &mut s.alloc);
         assert_eq!(s.alloc.free_count(), 8, "pool must come back whole");
         assert_eq!(seq.table.len_blocks(), 0);
-        seq.release(&mut s.alloc); // idempotent: take_blocks left it empty
+        seq.release(&mut s.prefix_cache, &mut s.alloc); // idempotent: take_blocks left it empty
         assert_eq!(s.alloc.free_count(), 8, "second release must not double-free");
     }
 
@@ -492,14 +494,14 @@ mod tests {
         s.admit(j, &tok, tok.get_vocab_size(true), EOS).unwrap();
         let mut seq = s.waiting.pop_front().unwrap();
 
-        seq.ensure_blocks(&mut s.alloc, 12);
+        seq.ensure_blocks(&mut s.prefix_cache, &mut s.alloc, 12);
         seq.tokens.extend_from_slice(&[12095, 11, 323]);
         seq.pos = 8;
         seq.emitted = 17;
         seq.state = State::Running;
         let tokens_before = seq.tokens.clone();
 
-        seq.preempt(&mut s.alloc);
+        seq.preempt(&mut s.prefix_cache, &mut s.alloc);
 
         assert_eq!(s.alloc.free_count(), 8, "preemption must free every block");
         assert_eq!(seq.table.len_blocks(), 0);
@@ -529,7 +531,7 @@ mod tests {
         let mut seqs: Vec<Sequence> = Vec::new();
         for (n, want) in [5usize, 9, 13, 4].iter().enumerate() {
             let mut seq = s.waiting.pop_front().unwrap();
-            assert!(seq.ensure_blocks(&mut s.alloc, *want), "seq {n} should fit");
+            assert!(seq.ensure_blocks(&mut s.prefix_cache, &mut s.alloc, *want), "seq {n} should fit");
             seq.state = State::Running;
             seqs.push(seq);
         }
@@ -537,13 +539,13 @@ mod tests {
         assert_eq!(s.alloc.free_count() + held, s.alloc.total_blocks());
 
         // Preempt one, finish one, leave two running.
-        seqs[3].preempt(&mut s.alloc);
-        seqs[1].release(&mut s.alloc);
+        seqs[3].preempt(&mut s.prefix_cache, &mut s.alloc);
+        seqs[1].release(&mut s.prefix_cache, &mut s.alloc);
         let held: usize = seqs.iter().map(|q| q.table.len_blocks()).sum();
         assert_eq!(s.alloc.free_count() + held, s.alloc.total_blocks());
 
         for q in seqs.iter_mut() {
-            q.release(&mut s.alloc);
+            q.release(&mut s.prefix_cache, &mut s.alloc);
         }
         assert_eq!(s.alloc.free_count(), s.alloc.total_blocks(), "pool leaked");
     }
