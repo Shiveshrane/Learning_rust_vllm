@@ -50,6 +50,13 @@ struct Sequence{
     finish:Option<StopReason>,
 }
 
+fn publish(prefix:&mut PrefixCache, seq:&Sequence){
+    let hashes=prefix.hash_chain(&seq.tokens[..seq.pos]);
+    for (h, &b) in hashes.iter().zip(seq.table.blocks()){
+        prefix.insert(*h, b);
+    }
+}
+
 
 impl Sequence{
     fn new(
@@ -164,18 +171,27 @@ impl Scheduler{
         self.waiting.is_empty() && self.running.is_empty()
     }
 
-    pub fn check_invariant(&self){
-        let held:usize=self.running.iter().map(|s| s.table.len_blocks())
-        .sum::<usize>()
-        +self.waiting.iter().map(|s| s.table.len_blocks())
-        .sum::<usize>();
+    // pub fn check_invariant(&self){
+    //     let held:usize=self.running.iter().map(|s| s.table.len_blocks())
+    //     .sum::<usize>()
+    //     +self.waiting.iter().map(|s| s.table.len_blocks())
+    //     .sum::<usize>();
 
+    //     debug_assert_eq!(
+    //         self.alloc.free_count()+held,
+    //         self.alloc.total_blocks(),
+    //         "Block accounting broken"
+    //     );
+    // }
+
+    pub fn check_invariant(&self){
         debug_assert_eq!(
-            self.alloc.free_count()+held,
+            self.alloc.free_count()+self.prefix_cache.live_blocks()+self.prefix_cache.parked(),
             self.alloc.total_blocks(),
             "Block accounting broken"
         );
     }
+
     pub fn step(&mut self, model:&qwen::model::Qwen2, tok:&tokenizers::Tokenizer, device:&Device)->Result<()>{
         let admitted=self.schedule();
         if admitted>0{
@@ -191,6 +207,14 @@ impl Scheduler{
     fn schedule(&mut self)->usize{
         let mut admitted=0;
         while let Some(seq)=self.waiting.front_mut(){
+            if seq.table.len_blocks()==0{
+                // If the sequence has no blocks, try to match a prefix in the cache
+                let n=seq.tokens.len().saturating_sub(1);
+                for id in self.prefix_cache.match_prefix(&seq.tokens[0..n]){
+                    seq.table.append_block(id);
+                }
+                seq.pos=seq.table.len_blocks()*self.block_size;
+            }
             if !seq.ensure_blocks(&mut self.prefix_cache, &mut self.alloc, seq.tokens.len()){
                 break;
             }
@@ -203,13 +227,15 @@ impl Scheduler{
 
     fn prefill(&mut self, model:&qwen::model::Qwen2, device:&Device)->Result<()>{
         for seq in self.running.iter_mut().filter(|s| s.last.is_none()){
-            let input=Tensor::new(seq.tokens.as_slice(), device)?.unsqueeze(0)?;
+            let input=Tensor::new(&seq.tokens[seq.pos..], device)?.unsqueeze(0)?;
             let logits={
                 let store=PagedStore::new(&self.pool, &seq.table);
-                model.forward_prefill(&input, &store, 0)?
+                model.forward_prefill(&input, &store, seq.pos)?
             };
-            seq.last=Some(logits.i((0, seq.tokens.len()-1))?.to_dtype(DType::F32)?);
+            let computed=seq.tokens.len()-seq.pos;
+            seq.last=Some(logits.i((0, computed-1))?.to_dtype(DType::F32)?);
             seq.pos=seq.tokens.len();
+            publish(&mut self.prefix_cache, seq);
         }
         Ok(())
     }
@@ -271,6 +297,9 @@ impl Scheduler{
             let seq=&mut self.running[i];
             seq.last=Some(logits.i((row, 0))?.to_dtype(DType::F32)?);
             seq.pos+=1;
+            if seq.pos%self.block_size==0{
+                publish(&mut self.prefix_cache, seq);
+            }
         }
 
         self.preempt(&preempt_ids);
@@ -561,4 +590,258 @@ mod tests {
         s.admit(j, &tok, tok.get_vocab_size(true), EOS).unwrap();
         assert!(rx.try_recv().is_err(), "a successful admit sends nothing");
     }
+
+    // ===========================================================================
+    // TESTS WRITTEN BY CLAUDE — Day 4 Block 2, prefix-cache gate.
+    //
+    // Proves three things on the real checkpoint:
+    //
+    //   1. SHARING HAPPENS. A second request with the same system prompt points
+    //      its block table at the FIRST request's physical blocks, and the cache
+    //      holds fewer distinct blocks than the two tables reference.
+    //   2. OUTPUT IS UNCHANGED. Compared against a control run that differs only
+    //      in whether sharing happened — same prompts, same batching, same order
+    //      of decode steps — so any difference is attributable to the cache.
+    //   3. IT IS FASTER. Prefill for the second request computes only the tail.
+    //
+    // Plus: the block invariant is checked at every stage while blocks are
+    // shared, and after both finish the shared blocks are PARKED (not freed) and
+    // a later request revives them from the LRU.
+    //
+    // Loads ~7GB of F32 weights, so it is #[ignore]d to keep the unit suite fast:
+    //
+    //     cargo test -p engine --lib prefix_cache -- --ignored --nocapture
+    //
+    // Run it WITHOUT --release: check_invariant is a debug_assert, and watching
+    // the accounting hold while blocks are shared is half the point.
+    // ===========================================================================
+
+    const RBS: usize = 16;
+
+    struct Real {
+        model: Qwen2,
+        tok: tokenizers::Tokenizer,
+        device: Device,
+        cfg: QwenConfig,
+    }
+
+    fn real() -> Real {
+        let path = qwen::paths::ModelPaths::from_cache().expect("checkpoint in HF cache");
+        let cfg = QwenConfig::from_path(&path.config).unwrap();
+        let tok = tokenizers::Tokenizer::from_file(&path.tokenizer).unwrap();
+        let device = qwen::device::pick(qwen::device::Backend::Auto).unwrap();
+        let vb = unsafe {
+            candle_nn::VarBuilder::from_mmaped_safetensors(&path.weights, DType::F32, &device)
+                .unwrap()
+        };
+        let model = Qwen2::load(&cfg, 4096, vb).unwrap();
+        Real { model, tok, device, cfg }
+    }
+
+    fn real_scheduler(r: &Real) -> Scheduler {
+        let pool = KVPool::new(&r.cfg, 256, RBS, KVDType::F32, &r.device).unwrap();
+        Scheduler::new(pool, RBS)
+    }
+
+    /// Pull every queued event for one stream. Returns true once it is Done.
+    fn drain(rx: &mut mpsc::UnboundedReceiver<Event>, text: &mut String) -> bool {
+        let mut done = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                Event::Token(t) => text.push_str(&t),
+                Event::Done { .. } => done = true,
+                Event::Error(e) => panic!("stream errored: {e}"),
+            }
+        }
+        done
+    }
+
+    /// Step the scheduler until every stream has reported Done.
+    fn finish(
+        s: &mut Scheduler,
+        r: &Real,
+        rxs: &mut [mpsc::UnboundedReceiver<Event>],
+        texts: &mut [String],
+    ) {
+        let mut done = vec![false; rxs.len()];
+        for _ in 0..1000 {
+            for i in 0..rxs.len() {
+                if drain(&mut rxs[i], &mut texts[i]) {
+                    done[i] = true;
+                }
+            }
+            if done.iter().all(|d| *d) {
+                return;
+            }
+            s.step(&r.model, &r.tok, &r.device).unwrap();
+        }
+        panic!("streams never finished");
+    }
+
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        (a - b).unwrap().abs().unwrap().flatten_all().unwrap()
+            .max(0).unwrap().to_scalar::<f32>().unwrap()
+    }
+
+    /// A system prompt long enough to span many 16-token blocks, the way a real
+    /// deployment prepends the same instructions to every request.
+    fn system_prompt() -> String {
+        let rules = [
+            "You are a careful assistant working at a public library.",
+            "Answer the visitor's question directly and in one short sentence.",
+            "If you are not sure of a fact, say so plainly instead of guessing.",
+            "Never invent book titles, authors, page numbers, or publication dates.",
+            "Prefer simple everyday words over technical vocabulary when possible.",
+            "Be polite, but do not add greetings, apologies, or sign-offs.",
+        ];
+        let mut s = String::new();
+        for _ in 0..3 {
+            for r in rules {
+                s.push_str(r);
+                s.push(' ');
+            }
+        }
+        s
+    }
+
+    #[test]
+    #[ignore = "loads the real checkpoint; run with --ignored"]
+    fn prefix_cache_shares_blocks_and_preserves_output() {
+        let r = real();
+        let vocab = r.tok.get_vocab_size(true);
+        let eos = r.cfg.eos_token_id;
+
+        let system = system_prompt();
+        let prompt_a = format!("{system}Question: What is the capital of France? Answer:");
+        let prompt_b = format!("{system}Question: Name one large ocean. Answer:");
+        let prompt_c = format!("{system}Question: What colour is a clear sky? Answer:");
+
+        // ---- warm-up --------------------------------------------------------
+        // The first forward pass pays Metal kernel compilation (~800ms). Burn it
+        // on an unrelated prompt so the cold/warm timing below compares prefill
+        // against prefill, not prefill against compilation.
+        {
+            let mut w = real_scheduler(&r);
+            let (j, rx) = job(&"Warming up the kernels before measuring. ".repeat(20));
+            w.admit(j, &r.tok, vocab, eos).unwrap();
+            let mut rxs = [rx];
+            finish(&mut w, &r, &mut rxs, &mut [String::new()]);
+        }
+
+        // ---- control: same two requests, NO sharing -------------------------
+        // Admitted in the same schedule() call, so B is matched before A has
+        // published anything. Identical prompts, identical decode batching —
+        // the only difference from the run below is whether B adopts A's blocks.
+        let (ctl_b_logits, ctl_texts) = {
+            let mut s0 = real_scheduler(&r);
+            let (ja, rxa) = job(&prompt_a);
+            let (jb, rxb) = job(&prompt_b);
+            s0.admit(ja, &r.tok, vocab, eos).unwrap();
+            s0.admit(jb, &r.tok, vocab, eos).unwrap();
+            assert_eq!(s0.schedule(), 2);
+            assert_eq!(s0.running[1].pos, 0, "control: cache was empty when B was matched");
+            s0.prefill(&r.model, &r.device).unwrap();
+            s0.check_invariant();
+            let b_logits = s0.running[1].last.clone().unwrap();
+            let mut texts = [String::new(), String::new()];
+            finish(&mut s0, &r, &mut [rxa, rxb], &mut texts);
+            (b_logits, texts)
+        };
+
+        // ---- shared: A first, then B arrives while A is still running -------
+        let mut s = real_scheduler(&r);
+
+        let (ja, rxa) = job(&prompt_a);
+        s.admit(ja, &r.tok, vocab, eos).unwrap();
+        s.schedule();
+        let cold_tokens = s.running[0].tokens.len() - s.running[0].pos;
+        let t = std::time::Instant::now();
+        s.prefill(&r.model, &r.device).unwrap();
+        let cold = t.elapsed();
+        s.check_invariant();
+
+        let (jb, rxb) = job(&prompt_b);
+        s.admit(jb, &r.tok, vocab, eos).unwrap();
+        s.schedule();
+        s.check_invariant();
+
+        // 1. Sharing happened, and it is the RIGHT amount of sharing.
+        let (a, b) = (&s.running[0], &s.running[1]);
+        let common = a
+            .tokens
+            .iter()
+            .zip(&b.tokens)
+            .take_while(|(x, y)| x == y)
+            .count();
+        let expected = (common.min(b.tokens.len() - 1)) / RBS;
+        let adopted = b.pos / RBS;
+        println!("\n  prompts share {common} tokens -> expect {expected} full blocks adopted");
+        println!("  B adopted {adopted} blocks, pos = {}", b.pos);
+        assert!(adopted > 0, "B adopted nothing: publish or match_prefix is not working");
+        assert_eq!(adopted, expected, "every fully-shared block should be adopted, and no more");
+        assert_eq!(b.pos, adopted * RBS, "pos must sit on a block boundary");
+        assert_eq!(
+            &b.table.blocks()[..adopted],
+            &a.table.blocks()[..adopted],
+            "B must point at A's physical blocks, not copies of them"
+        );
+
+        let referenced = a.table.len_blocks() + b.table.len_blocks();
+        let live = s.prefix_cache.live_blocks();
+        println!("  tables reference {referenced} blocks; {live} distinct blocks are live");
+        assert_eq!(
+            live,
+            referenced - adopted,
+            "each shared block must be counted once, not once per sequence"
+        );
+
+        // 3. It is faster: only the tail of B's prompt goes through the model.
+        let warm_tokens = b.tokens.len() - b.pos;
+        let t = std::time::Instant::now();
+        s.prefill(&r.model, &r.device).unwrap();
+        let warm = t.elapsed();
+        s.check_invariant();
+        println!("  A (cold) prefilled {cold_tokens} tokens in {cold:?}");
+        println!("  B (warm) prefilled {warm_tokens} tokens in {warm:?}");
+        println!(
+            "  speedup {:.1}x",
+            cold.as_secs_f64() / warm.as_secs_f64().max(1e-9)
+        );
+        assert!(warm_tokens < cold_tokens / 4, "B should compute only its tail");
+        assert!(warm < cold, "prefilling the tail must be quicker than the whole prompt");
+
+        // 2. Output is unchanged: compare against the no-sharing control.
+        let b_logits = s.running[1].last.clone().unwrap();
+        let d = max_abs_diff(&b_logits, &ctl_b_logits);
+        println!("  B first-token logits vs control: max|diff| = {d:.6}");
+        assert!(d < 1e-3, "sharing changed B's logits by {d}");
+
+        let mut texts = [String::new(), String::new()];
+        finish(&mut s, &r, &mut [rxa, rxb], &mut texts);
+        println!("  A: {:?}", texts[0]);
+        println!("  B: {:?}", texts[1]);
+        assert_eq!(texts[0], ctl_texts[0], "A's output changed");
+        assert_eq!(texts[1], ctl_texts[1], "B's output changed when it shared A's blocks");
+
+        // ---- after both finish: blocks are parked, not freed ------------------
+        s.check_invariant();
+        assert_eq!(s.prefix_cache.live_blocks(), 0, "nobody is running, nothing is held");
+        let parked = s.prefix_cache.parked();
+        println!("  after both finish: {parked} blocks parked in the LRU");
+        assert!(parked >= adopted, "shared blocks should be retained in the LRU");
+
+        // ---- a later request revives them from the LRU ------------------------
+        let (jc, _rxc) = job(&prompt_c);
+        s.admit(jc, &r.tok, vocab, eos).unwrap();
+        s.schedule();
+        s.check_invariant();
+        let c = &s.running[0];
+        println!(
+            "  C arrived after everyone finished and adopted {} blocks from the LRU",
+            c.pos / RBS
+        );
+        assert!(c.pos > 0, "C should revive the parked system-prompt blocks");
+        assert!(s.prefix_cache.parked() < parked, "revived blocks leave the LRU");
+    }
 }
+
