@@ -1,8 +1,39 @@
 use anyhow::{Context, Result};
 use serde ::{Deserialize};
 use std::path::Path;
-#[derive(Debug, Clone, Deserialize)]
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag="type", rename_all="lowercase")]
+
+pub enum RopeScaling{
+    #[serde(rename="linear")]
+    Pi{
+        factor: f64,
+    },
+    #[serde(rename="ntk")]
+    NtkAware{
+        factor: f64,
+    },
+
+    Yarn{
+        factor:f64,
+        original_max_position_embeddings:usize,
+        #[serde(default = "default_beta_fast")]
+        beta_fast:f64,
+        #[serde(default = "default_beta_slow")]
+        beta_slow:f64,
+    },
+}
+
+fn default_beta_fast()->f64{
+    32.0
+}
+
+fn default_beta_slow()->f64{
+    1.0
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct QwenConfig{
     pub hidden_size: usize,
     pub intermediate_size: usize,
@@ -15,7 +46,11 @@ pub struct QwenConfig{
     pub rope_theta: f64,
     pub tie_word_embeddings: bool,
     pub eos_token_id: u32,
+    pub rope_scaling: Option<RopeScaling>,
 }
+
+
+
 
 impl QwenConfig{
     // parse config.json from a path

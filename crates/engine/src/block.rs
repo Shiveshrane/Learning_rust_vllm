@@ -81,6 +81,10 @@ pub fn blocks_for_budget(budget_bytes:usize, cfg:&QwenConfig, block_size:usize, 
 
     budget_bytes/(cfg.kv_bytes_per_token(dtype_bytes)*block_size)
 }
+
+
+
+
 // ===========================================================================
 // WRITTEN BY CLAUDE — Day 3 Block 1, block allocator and block table tests.
 //

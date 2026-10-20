@@ -206,6 +206,7 @@ mod tests {
             rope_theta: 10000.0,
             tie_word_embeddings: false,
             eos_token_id: 1,
+            rope_scaling: None,
         }
     }
 

@@ -12,6 +12,7 @@ pub mod cache;
 pub mod device;
 pub mod paths;
 pub mod model;
+pub mod rope;
 
 /// Time an expression, returning `(value, elapsed)`.
 ///
@@ -26,3 +27,5 @@ macro_rules! timeit {
         (__v, __start.elapsed())
     }};
 }
+
+

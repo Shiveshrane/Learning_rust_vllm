@@ -336,6 +336,29 @@ impl Scheduler{
     }
 }
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // ===========================================================================
 // TESTS WRITTEN BY CLAUDE — Day 3 Block 3, Sequence state machine.
 //
@@ -369,6 +392,7 @@ mod tests {
             rope_theta: 10000.0,
             tie_word_embeddings: false,
             eos_token_id: EOS,
+            rope_scaling: None,
         }
     }
 
@@ -392,20 +416,6 @@ mod tests {
         let pool = KVPool::new(&cfg(), num_blocks, BS, KVDType::F32, &Device::Cpu).unwrap();
         Scheduler::new(pool, BS)
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     // ---- admit ------------------------------------------------------------
 
